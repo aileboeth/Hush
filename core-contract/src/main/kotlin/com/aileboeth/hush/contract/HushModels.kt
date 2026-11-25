@@ -23,6 +23,7 @@ enum class CleanupAction {
     SOFT_TRIM,
     RESTRICT_CHANGED,
     RESTORE_ALL,
+    STOP_USER,
 }
 
 enum class CleanupTrigger {
@@ -49,9 +50,10 @@ data class AppRestriction(
     val restrictBackground: Boolean = false,
     val restrictWakeLock: Boolean = false,
     val restrictedBucket: Boolean = false,
+    val disableApp: Boolean = false,
 ) {
     val hasAnyRestriction: Boolean
-        get() = restrictBackground || restrictWakeLock || restrictedBucket
+        get() = restrictBackground || restrictWakeLock || restrictedBucket || disableApp
 }
 
 data class ManagedAppInfo(
@@ -98,6 +100,24 @@ data class MemoryOverview(
         get() = if (swapTotalKb > 0L) (swapUsedKb.toFloat() / swapTotalKb.toFloat()).coerceIn(0f, 1f) else 0f
 }
 
+data class SecondaryUserInfo(
+    val userId: Int,
+    val name: String,
+    val running: Boolean = false,
+    val isCurrent: Boolean = false,
+    val processCount: Int = 0,
+    val totalPssKb: Long = 0L,
+    val swapPssKb: Long = 0L,
+    val isManagedProfile: Boolean = false,
+    val isCloneProfile: Boolean = false,
+) {
+    val canStop: Boolean
+        get() = userId > 0 && running && !isCurrent
+
+    val isFullSecondarySystem: Boolean
+        get() = userId > 0 && !isManagedProfile && !isCloneProfile
+}
+
 data class PolicyConfig(
     val enabled: Boolean = true,
     val backgroundTimeoutMinutes: Int = 3,
@@ -109,6 +129,9 @@ data class PolicyConfig(
     val minAvailableRamMb: Int = 1280,
     val pollIntervalSeconds: Int = 30,
     val softTrimIncludeDualSpace: Boolean = false,
+    val autoStopSecondaryUsers: Boolean = true,
+    val secondaryUserStopDelayMinutes: Int = 1,
+    val screenOffStopSecondaryUsers: Boolean = true,
 )
 
 data class CleanupEvent(

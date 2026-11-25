@@ -1,5 +1,6 @@
 package com.aileboeth.hush.daemon
 
+import com.aileboeth.hush.contract.HushLog
 import com.aileboeth.hush.contract.HushProtocol
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -21,8 +22,10 @@ object DaemonMain {
 
     @JvmStatic
     fun main(args: Array<String>) {
+        HushLog.configure("daemon", null)
         // Guard against stray worker exceptions killing app_process64
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            HushLog.e("DaemonUncaught", "Thread '${thread.name}' crashed", throwable)
             System.err.println(
                 "HUSH_DAEMON_UNCAUGHT[${thread.name}]: ${throwable.javaClass.simpleName}: ${throwable.message}"
             )
@@ -70,6 +73,7 @@ object DaemonMain {
         )
 
         val actualPort = server.start()
+        HushLog.i("DaemonMain", "Daemon ready pid=${bridge.currentPid()} uid=${bridge.currentUid()} port=$actualPort vc=$versionCode")
         // Signal the bootstrapper on stdout with the bound loopback port
         println("${HushProtocol.READY_PREFIX}$actualPort")
         System.out.flush()
@@ -89,6 +93,7 @@ object DaemonMain {
                     lastApkCheckMs = now
                     val latestApk = bridge.getSelfApkPath()
                     if (latestApk != null && latestApk != initialApkPath) {
+                        HushLog.i("DaemonMain", "APK upgrade detected, shutting down cleanly")
                         server.stop()
                         shutdownLatch.countDown()
                         return@runCatching
@@ -99,6 +104,8 @@ object DaemonMain {
                     nextTickAtMs = now + intervalMs
                     engine.tick()
                 }
+            }.onFailure { err ->
+                HushLog.e("PolicyTick", "Scheduler tick failed", err)
             }
         }, 5, 5, TimeUnit.SECONDS)
 

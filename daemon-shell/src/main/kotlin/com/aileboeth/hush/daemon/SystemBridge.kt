@@ -3,6 +3,7 @@ package com.aileboeth.hush.daemon
 import com.aileboeth.hush.contract.AppRestriction
 import com.aileboeth.hush.contract.AppRuntimeSample
 import com.aileboeth.hush.contract.MemoryOverview
+import com.aileboeth.hush.contract.SecondaryUserInfo
 import com.aileboeth.hush.contract.StandbyBucket
 
 /**
@@ -54,5 +55,18 @@ interface SystemBridge {
     fun softTrim(packageName: String, userId: Int = 0): Boolean
 
     fun applyRestriction(packageName: String, restriction: AppRestriction, userId: Int = 0): Boolean
+    fun lastRestrictionError(): String? = null
     fun readRestriction(packageName: String, userId: Int = 0): Pair<AppRestriction, StandbyBucket>
+
+    /** Active foreground Android user ID (`0` for primary owner, `10+` for secondary spaces). */
+    fun getCurrentUserId(): Int = 0
+
+    /** Lists all secondary Android users (`userId > 0`) with live running state and memory footprint. */
+    fun listSecondaryUsers(): List<SecondaryUserInfo> = emptyList()
+
+    /**
+     * Stops an entire background secondary Android user via `am stop-user -w -f <userId>`.
+     * MUST reject `userId <= 0` and the currently active foreground user.
+     */
+    fun stopUser(userId: Int): Boolean = false
 }

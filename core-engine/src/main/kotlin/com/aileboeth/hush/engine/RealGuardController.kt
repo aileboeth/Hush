@@ -9,12 +9,15 @@ import com.aileboeth.hush.contract.AppRestriction
 import com.aileboeth.hush.contract.AppRuntimeSample
 import com.aileboeth.hush.contract.CleanupEvent
 import com.aileboeth.hush.contract.DaemonStatus
+import com.aileboeth.hush.contract.DiagnosticLogEntry
 import com.aileboeth.hush.contract.GuardController
+import com.aileboeth.hush.contract.HushLog
 import com.aileboeth.hush.contract.HushProtocol
 import com.aileboeth.hush.contract.ManagedAppInfo
 import com.aileboeth.hush.contract.MemoryOverview
 import com.aileboeth.hush.contract.PolicyConfig
 import com.aileboeth.hush.contract.SafetyGuardrails
+import com.aileboeth.hush.contract.SecondaryUserInfo
 import com.aileboeth.hush.contract.intVal
 import com.aileboeth.hush.contract.listOfObj
 import com.aileboeth.hush.contract.longVal
@@ -53,6 +56,9 @@ class RealGuardController(
     private val _cleanupLogs = MutableStateFlow<List<CleanupEvent>>(emptyList())
     override val cleanupLogs: StateFlow<List<CleanupEvent>> = _cleanupLogs.asStateFlow()
 
+    private val _secondaryUsers = MutableStateFlow<List<SecondaryUserInfo>>(emptyList())
+    override val secondaryUsers: StateFlow<List<SecondaryUserInfo>> = _secondaryUsers.asStateFlow()
+
     suspend fun attachSession(port: Int, token: String): Result<Unit> {
         _daemonStatus.value = DaemonStatus.Connecting
         val conn = client.connect(port, token)
@@ -76,6 +82,7 @@ class RealGuardController(
         val statusRes = client.call(HushProtocol.METHOD_STATUS)
         if (statusRes.isFailure) {
             _daemonStatus.value = DaemonStatus.Disconnected
+            _secondaryUsers.value = emptyList()
             // Even when disconnected, show installed apps + saved groups so the user can configure offline
             _managedApps.value = mergeAppsWithSamples(installed, emptyMap())
             return Result.failure(statusRes.exceptionOrNull()!!)
@@ -113,6 +120,12 @@ class RealGuardController(
                 ev.copy(appLabel = labelCache[ev.packageName] ?: ev.appLabel)
             }
             _cleanupLogs.value = logs
+        }
+
+        client.call(HushProtocol.METHOD_GET_SECONDARY_USERS).onSuccess { resp ->
+            val users = resp.obj("data")?.listOfObj("users").orEmpty()
+                .map(HushProtocol::decodeSecondaryUser)
+            _secondaryUsers.value = users
         }
 
         return Result.success(Unit)
@@ -211,11 +224,50 @@ class RealGuardController(
         }
     }
 
+    override suspend fun stopSecondaryUser(userId: Int): Result<Long> {
+        if (userId <= 0) {
+            return Result.failure(SecurityException("主系统用户受保护，不能停机"))
+        }
+        val res = client.call(HushProtocol.METHOD_STOP_USER, mapOf("userId" to userId))
+        return res.map { resp ->
+            resp.obj("data")?.longVal("freedKb") ?: 0L
+        }.also {
+            if (it.isSuccess) {
+                HushLog.i("Guard", "Stopped secondary userId=$userId freedKb=${it.getOrNull()}")
+                refreshSnapshot()
+            } else {
+                HushLog.w("Guard", "stopSecondaryUser($userId) failed", it.exceptionOrNull())
+            }
+        }
+    }
+
+    override suspend fun fetchDiagnostics(): Result<List<DiagnosticLogEntry>> {
+        val local = HushLog.snapshot()
+        val daemonEntries = if (client.currentSession != null) {
+            client.call(HushProtocol.METHOD_GET_DIAGNOSTICS).getOrNull()
+                ?.obj("data")?.listOfObj("entries").orEmpty()
+                .map(HushProtocol::decodeDiagnosticEntry)
+        } else {
+            emptyList()
+        }
+        val merged = (local + daemonEntries).sortedBy { it.timestampMs }
+        return Result.success(merged)
+    }
+
+    override suspend fun clearDiagnostics(): Result<Unit> {
+        HushLog.clear()
+        if (client.currentSession != null) {
+            client.call(HushProtocol.METHOD_CLEAR_DIAGNOSTICS)
+        }
+        return Result.success(Unit)
+    }
+
     override suspend fun stopDaemon(): Result<Unit> {
         val res = client.call(HushProtocol.METHOD_SHUTDOWN)
         client.disconnect()
         store.clearSession()
         _daemonStatus.value = DaemonStatus.Disconnected
+        _secondaryUsers.value = emptyList()
         return res.map { }
     }
 
@@ -231,7 +283,10 @@ class RealGuardController(
         for (ai in apps) {
             val isSystem = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0
             val isUpdatedSystem = (ai.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
-            if (isSystem && !isUpdatedSystem) continue
+            val isTracked = ai.packageName in configSnapshot.appliedRestrictions ||
+                ai.packageName in configSnapshot.appGroups ||
+                !ai.enabled
+            if (isSystem && !isUpdatedSystem && !isTracked) continue
             if (ai.packageName == SafetyGuardrails.SELF_PACKAGE) continue
             val label = pm.getApplicationLabel(ai).toString()
             labelCache[ai.packageName] = label

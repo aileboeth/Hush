@@ -2,8 +2,10 @@ package com.aileboeth.hush.daemon
 
 import com.aileboeth.hush.contract.AppRestriction
 import com.aileboeth.hush.contract.AppRuntimeSample
+import com.aileboeth.hush.contract.HushLog
 import com.aileboeth.hush.contract.MemoryOverview
 import com.aileboeth.hush.contract.SafetyGuardrails
+import com.aileboeth.hush.contract.SecondaryUserInfo
 import com.aileboeth.hush.contract.StandbyBucket
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -24,6 +26,11 @@ class AndroidSystemBridge : SystemBridge {
 
     private val uidToPkgCache = HashMap<Int, String>()
     private var uidCacheUpdatedMs = 0L
+
+    @Volatile
+    private var lastApplyRestrictionError: String? = null
+
+    override fun lastRestrictionError(): String? = lastApplyRestrictionError
 
     override fun nowMs(): Long = System.currentTimeMillis()
 
@@ -121,14 +128,17 @@ class AndroidSystemBridge : SystemBridge {
     }
 
     override fun samplePackagesBatch(packages: List<String>, userId: Int): Map<String, AppRuntimeSample> {
-        // 1. Single device-wide `dumpsys meminfo -S` gives PSS + Swap PSS + process counts for ALL apps
+        // 1. Single device-wide `dumpsys meminfo -S` + `ps` PID->userId map gives exact PSS + Swap PSS
+        //    even on ROMs (e.g. OriginOS) that omit `(user 10)` tags in `dumpsys meminfo -S`.
         val memOut = execCommand(listOf("dumpsys", "meminfo", "-S"), timeoutMs = 15_000)
-        val memByPkg = parseBatchMeminfo(memOut, targetUserId = userId)
+        val pidToUser = parsePsPidUsers(execCommand(listOf("ps", "-A", "-o", "USER,PID"), timeoutMs = 4_000))
+        val memByPkg = parseBatchMeminfo(memOut, targetUserId = userId, pidToUserId = pidToUser)
 
-        // 2. Single O(1) queries for appops restrictions & standby buckets
+        // 2. Single O(1) queries for appops restrictions, standby buckets & disabled packages
         val bgRestricted = queryRestrictedAppOps("RUN_ANY_IN_BACKGROUND", userId)
         val wlRestricted = queryRestrictedAppOps("WAKE_LOCK", userId)
         val buckets = queryAllStandbyBuckets(userId)
+        val disabledPkgs = queryDisabledPackages(userId)
 
         // 3. Single O(1) query for frozen packages via `dumpsys activity processes`
         //    (On OriginOS, `dumpsys activity processes` exposes both AOSP `isFrozen=true` and
@@ -144,6 +154,7 @@ class AndroidSystemBridge : SystemBridge {
                 restrictBackground = pkg in bgRestricted,
                 restrictWakeLock = pkg in wlRestricted,
                 restrictedBucket = bucket == StandbyBucket.RESTRICTED,
+                disableApp = pkg in disabledPkgs,
             )
             result[pkg] = AppRuntimeSample(
                 packageName = pkg,
@@ -186,6 +197,14 @@ class AndroidSystemBridge : SystemBridge {
         return parseAllStandbyBuckets(out)
     }
 
+    private fun queryDisabledPackages(userId: Int): Set<String> {
+        val out = execCommand(
+            listOf("pm", "list", "packages", "-d", "--user", userId.toString()),
+            timeoutMs = 4_000,
+        )
+        return parsePmPackageLines(out)
+    }
+
     override fun forceStop(packageName: String, userId: Int): Boolean {
         if (SafetyGuardrails.isSystemProtected(packageName)) return false
         if (tryBinderForceStop(packageName, userId)) return true
@@ -216,7 +235,45 @@ class AndroidSystemBridge : SystemBridge {
     }
 
     override fun applyRestriction(packageName: String, restriction: AppRestriction, userId: Int): Boolean {
-        if (SafetyGuardrails.isSystemProtected(packageName)) return false
+        lastApplyRestrictionError = null
+        if (SafetyGuardrails.isSystemProtected(packageName)) {
+            lastApplyRestrictionError = "系统核心组件受保护，禁止修改后台限制"
+            return false
+        }
+
+        // Apply `pm disable-user / enable` FIRST so an OEM SecurityException never leaves partial appops edits
+        if (restriction.disableApp) {
+            val (code, out) = execCommandWithCode(
+                listOf("pm", "disable-user", "--user", userId.toString(), packageName),
+                timeoutMs = 5_000,
+            )
+            if (code != 0) {
+                lastApplyRestrictionError = if (out.contains("no root permission", ignoreCase = true) ||
+                    out.contains("SecurityException", ignoreCase = true)
+                ) {
+                    "当前厂商系统限制免 Root 停用此预装组件（第三方应用仍可正常停用）"
+                } else {
+                    "停用 $packageName 失败：${out.lineSequence().firstOrNull { it.isNotBlank() }?.take(80) ?: "错误码 $code"}"
+                }
+                HushLog.w("Bridge", "pm disable-user failed pkg=$packageName user=$userId rc=$code detail=${out.lineSequence().firstOrNull { it.isNotBlank() }?.take(120)}")
+                return false
+            }
+            HushLog.i("Bridge", "pm disable-user succeeded pkg=$packageName user=$userId")
+            forceStop(packageName, userId)
+        } else {
+            val currentlyDisabled = packageName in queryDisabledPackages(userId)
+            if (currentlyDisabled) {
+                val (code, out) = execCommandWithCode(
+                    listOf("pm", "enable", "--user", userId.toString(), packageName),
+                    timeoutMs = 5_000,
+                )
+                if (code != 0) {
+                    lastApplyRestrictionError = "恢复启用 $packageName 失败：${out.lineSequence().firstOrNull { it.isNotBlank() }?.take(80) ?: "错误码 $code"}"
+                    return false
+                }
+            }
+        }
+
         val bgMode = if (restriction.restrictBackground) "ignore" else "allow"
         val wlMode = if (restriction.restrictWakeLock) "ignore" else "allow"
         val bucket = if (restriction.restrictedBucket) "restricted" else "active"
@@ -249,14 +306,86 @@ class AndroidSystemBridge : SystemBridge {
             listOf("am", "get-standby-bucket", "--user", userId.toString(), packageName),
             timeoutMs = 3_000,
         ).trim()
+        val disabled = packageName in queryDisabledPackages(userId)
 
         val bucket = parseStandbyBucket(bucketOut)
         val restriction = AppRestriction(
             restrictBackground = bgOut.contains(": ignore") || bgOut.contains(": deny"),
             restrictWakeLock = wlOut.contains(": ignore") || wlOut.contains(": deny"),
             restrictedBucket = bucket == StandbyBucket.RESTRICTED,
+            disableApp = disabled,
         )
         return restriction to bucket
+    }
+
+    override fun getCurrentUserId(): Int {
+        val out = execCommand(listOf("am", "get-current-user"), timeoutMs = 3_000).trim()
+        return out.lineSequence().firstOrNull()?.trim()?.toIntOrNull() ?: 0
+    }
+
+    override fun listSecondaryUsers(): List<SecondaryUserInfo> {
+        val rawUsers = parsePmListUsers(execCommand(listOf("pm", "list", "users"), timeoutMs = 4_000))
+            .filter { it.userId > 0 }
+        if (rawUsers.isEmpty()) return emptyList()
+
+        val currentUser = getCurrentUserId()
+        val anyRunning = rawUsers.any { it.running }
+        val pidToUser = if (anyRunning) {
+            parsePsPidUsers(execCommand(listOf("ps", "-A", "-o", "USER,PID"), timeoutMs = 4_000))
+        } else {
+            emptyMap()
+        }
+        val psProcCounts = if (anyRunning) {
+            pidToUser.values.groupingBy { it }.eachCount()
+        } else {
+            emptyMap()
+        }
+        val memTotals = if (anyRunning) {
+            parseMeminfoUserTotals(
+                output = execCommand(listOf("dumpsys", "meminfo", "-S"), timeoutMs = 15_000),
+                pidToUserId = pidToUser,
+            )
+        } else {
+            emptyMap()
+        }
+
+        return rawUsers.map { u ->
+            val memAgg = memTotals[u.userId]
+            val isManaged = (u.flags and FLAG_MANAGED_PROFILE) != 0
+            val isClone = u.userId == 999 ||
+                ((u.flags and FLAG_PROFILE) != 0 && !isManaged && (u.flags and FLAG_FULL) == 0)
+            val procs = maxOf(memAgg?.processCount ?: 0, psProcCounts[u.userId] ?: 0)
+            SecondaryUserInfo(
+                userId = u.userId,
+                name = u.name.ifBlank { "User ${u.userId}" },
+                running = u.running,
+                isCurrent = u.userId == currentUser,
+                processCount = if (u.running) procs else 0,
+                totalPssKb = if (u.running) (memAgg?.totalPssKb ?: 0L) else 0L,
+                swapPssKb = if (u.running) (memAgg?.swapPssKb ?: 0L) else 0L,
+                isManagedProfile = isManaged,
+                isCloneProfile = isClone,
+            )
+        }.sortedWith(
+            compareByDescending<SecondaryUserInfo> { it.isFullSecondarySystem }
+                .thenByDescending { it.running }
+                .thenBy { it.userId }
+        )
+    }
+
+    override fun stopUser(userId: Int): Boolean {
+        if (userId <= 0) return false
+        if (getCurrentUserId() == userId) return false
+        val (code, out) = execCommandWithCode(
+            listOf("am", "stop-user", "-w", "-f", userId.toString()),
+            timeoutMs = 15_000,
+        )
+        if (code == 0) {
+            HushLog.i("Bridge", "am stop-user -w -f $userId succeeded")
+        } else {
+            HushLog.w("Bridge", "am stop-user -w -f $userId failed rc=$code out=${out.take(120)}")
+        }
+        return code == 0
     }
 
     private fun listPackageProcesses(packageName: String): List<String> {
@@ -308,6 +437,7 @@ class AndroidSystemBridge : SystemBridge {
             val finished = proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
             if (!finished) {
                 proc.destroyForcibly()
+                HushLog.w("Bridge", "Shell timeout (${timeoutMs}ms): ${args.take(4).joinToString(" ")}")
                 -1 to output
             } else {
                 proc.exitValue() to output
@@ -321,7 +451,20 @@ class AndroidSystemBridge : SystemBridge {
         var processCount: Int = 0,
     )
 
+    internal data class ParsedPmUser(
+        val userId: Int,
+        val name: String,
+        val flags: Int,
+        val running: Boolean,
+    )
+
     companion object {
+        private const val FLAG_MANAGED_PROFILE = 0x20
+        private const val FLAG_FULL = 0x400
+        private const val FLAG_PROFILE = 0x1000
+
+        private val PM_USER_LINE_REGEX = Regex("""UserInfo\{(\d+):([^:]*):([0-9a-fA-F]+)\}(?:\s+(running))?""")
+        private val PS_USER_PREFIX_REGEX = Regex("""^u(\d+)_""")
         private val UID_PKG_REGEX = Regex("""^package:(\S+)\s+uid:(\d+)""")
         private val RESUMED_ACTIVITY_REGEX = Regex("""(?:topResumedActivity|mResumedActivity|ResumedActivity)[=:][^\n]*?\s+([a-zA-Z0-9_.]+)/""")
         private val TOTAL_PSS_REGEX = Regex("""TOTAL PSS:\s+(\d+)""")
@@ -334,7 +477,7 @@ class AndroidSystemBridge : SystemBridge {
         // Matches lines inside `Total PSS by process:` of `dumpsys meminfo -S`:
         // e.g. "  1,523,308K: com.example.video (pid 6000 / activities) (   612,000K in swap)"
         // e.g. "    643,705K: com.example.chat (pid 10472) (user 999) (  180,000K in swap)"
-        private val BATCH_PSS_LINE_REGEX = Regex("""^\s*([\d,]+)K:\s+([a-zA-Z0-9_.:-]+)\s+\(pid\s+\d+""")
+        private val BATCH_PSS_LINE_REGEX = Regex("""^\s*([\d,]+)K:\s+([a-zA-Z0-9_.:-]+)\s+\(pid\s+(\d+)""")
         private val SWAP_IN_LINE_REGEX = Regex("""\(\s*([\d,]+)K in swap\)""")
         private val USER_IN_LINE_REGEX = Regex("""\(user (\d+)\)""")
         private val STANDBY_LINE_REGEX = Regex("""^\s*([a-zA-Z0-9_.]+)\s*[:=]\s*(\d+)""")
@@ -348,7 +491,11 @@ class AndroidSystemBridge : SystemBridge {
                 lower.contains(":push_")
         }
 
-        internal fun parseBatchMeminfo(output: String, targetUserId: Int = 0): Map<String, BatchMemAggregate> {
+        internal fun parseBatchMeminfo(
+            output: String,
+            targetUserId: Int = 0,
+            pidToUserId: Map<Int, Int> = emptyMap(),
+        ): Map<String, BatchMemAggregate> {
             val result = HashMap<String, BatchMemAggregate>()
             var inPssSection = false
             for (line in output.lineSequence()) {
@@ -362,7 +509,10 @@ class AndroidSystemBridge : SystemBridge {
                         break
                     }
                     val m = BATCH_PSS_LINE_REGEX.find(line) ?: continue
-                    val lineUser = USER_IN_LINE_REGEX.find(line)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    val pid = m.groupValues[3].toIntOrNull() ?: -1
+                    val lineUser = USER_IN_LINE_REGEX.find(line)?.groupValues?.get(1)?.toIntOrNull()
+                        ?: pidToUserId[pid]
+                        ?: 0
                     if (lineUser != targetUserId) continue
 
                     val pssKb = m.groupValues[1].replace(",", "").toLongOrNull() ?: 0L
@@ -380,12 +530,89 @@ class AndroidSystemBridge : SystemBridge {
             return result
         }
 
+        internal fun parsePmListUsers(output: String): List<ParsedPmUser> {
+            val list = ArrayList<ParsedPmUser>()
+            for (line in output.lineSequence()) {
+                val m = PM_USER_LINE_REGEX.find(line) ?: continue
+                val id = m.groupValues[1].toIntOrNull() ?: continue
+                val name = m.groupValues[2].trim()
+                val flags = m.groupValues[3].toIntOrNull(16) ?: 0
+                val running = m.groupValues[4].equals("running", ignoreCase = true)
+                list.add(ParsedPmUser(id, name, flags, running))
+            }
+            return list
+        }
+
+        internal fun parsePsPidUsers(output: String): Map<Int, Int> {
+            val result = HashMap<Int, Int>()
+            for (line in output.lineSequence()) {
+                val trimmed = line.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("USER")) continue
+                val parts = trimmed.split(Regex("\\s+"))
+                if (parts.size < 2) continue
+                val m = PS_USER_PREFIX_REGEX.find(parts[0]) ?: continue
+                val userId = m.groupValues[1].toIntOrNull() ?: continue
+                val pid = parts[1].toIntOrNull() ?: continue
+                if (userId > 0) {
+                    result[pid] = userId
+                }
+            }
+            return result
+        }
+
+        internal fun parseMeminfoUserTotals(
+            output: String,
+            pidToUserId: Map<Int, Int> = emptyMap(),
+        ): Map<Int, BatchMemAggregate> {
+            val result = HashMap<Int, BatchMemAggregate>()
+            var inPssSection = false
+            for (line in output.lineSequence()) {
+                val trimmed = line.trim()
+                if (trimmed.startsWith("Total PSS by process:")) {
+                    inPssSection = true
+                    continue
+                }
+                if (inPssSection) {
+                    if (trimmed.startsWith("Total PSS by OOM") || trimmed.startsWith("Total PSS by category")) {
+                        break
+                    }
+                    val m = BATCH_PSS_LINE_REGEX.find(line) ?: continue
+                    val pid = m.groupValues[3].toIntOrNull() ?: -1
+                    val lineUser = USER_IN_LINE_REGEX.find(line)?.groupValues?.get(1)?.toIntOrNull()
+                        ?: pidToUserId[pid]
+                        ?: 0
+                    if (lineUser <= 0) continue
+
+                    val pssKb = m.groupValues[1].replace(",", "").toLongOrNull() ?: 0L
+                    val swapKb = SWAP_IN_LINE_REGEX.find(line)?.groupValues?.get(1)
+                        ?.replace(",", "")?.toLongOrNull() ?: 0L
+                    val agg = result.getOrPut(lineUser) { BatchMemAggregate() }
+                    agg.totalPssKb += pssKb
+                    agg.swapPssKb += swapKb
+                    agg.processCount++
+                }
+            }
+            return result
+        }
+
         internal fun parsePackageLines(output: String): Set<String> {
             val set = HashSet<String>()
             for (line in output.lineSequence()) {
                 val t = line.trim()
                 if (t.isNotEmpty() && !t.contains(' ') && t.contains('.')) {
                     set.add(t)
+                }
+            }
+            return set
+        }
+
+        internal fun parsePmPackageLines(output: String): Set<String> {
+            val set = HashSet<String>()
+            for (line in output.lineSequence()) {
+                val t = line.trim()
+                if (t.startsWith("package:")) {
+                    val pkg = t.removePrefix("package:").trim()
+                    if (pkg.isNotEmpty()) set.add(pkg)
                 }
             }
             return set

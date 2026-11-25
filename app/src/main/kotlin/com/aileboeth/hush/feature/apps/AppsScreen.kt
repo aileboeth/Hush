@@ -339,7 +339,7 @@ fun AppsScreen(
     if (showRestoreDialog) {
         AppleConfirmDialog(
             title = "还原全部后台限制？",
-            message = "将恢复 Hush 写入过的 ${uiState.restrictedAppCount} 个应用的 appops 与待机桶修改，不影响你的应用档位配置。",
+            message = "将恢复 Hush 写入过的 ${uiState.restrictedAppCount} 个应用的 appops、待机桶修改，并自动重新启用已停用的应用，不影响应用档位配置。",
             confirmText = "确认还原",
             destructive = false,
             onDismiss = { showRestoreDialog = false },
@@ -417,6 +417,7 @@ private fun AppSharedElementRowCard(
                     )
                     // Pure memory/runtime line (no extra status words crammed in, preventing truncation!)
                     val memoryLine = when {
+                        app.restriction.disableApp -> "已停用 · 系统无法拉起"
                         app.totalPssKb > 0L && app.swapPssKb > 0L ->
                             "${formatMemoryKb(app.totalPssKb)} · Swap ${formatMemoryKb(app.swapPssKb)}"
                         app.totalPssKb > 0L -> formatMemoryKb(app.totalPssKb)
@@ -492,6 +493,7 @@ private fun AppSharedElementRowCard(
 private fun primaryStatusBadge(app: ManagedAppInfo): Triple<String, Color, Color>? {
     val c = HushTheme.colors
     return when {
+        app.restriction.disableApp -> Triple("已停用", c.red, c.redSoft)
         app.isPlayingAudio -> Triple("音频中", c.purple, c.purple.copy(alpha = if (c.isDark) 0.24f else 0.12f))
         app.restriction.hasAnyRestriction -> Triple("已限后台", c.orange, c.orangeSoft)
         app.isFrozen -> Triple("冻结", c.indigo, c.indigoSoft)

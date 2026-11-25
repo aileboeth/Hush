@@ -217,6 +217,7 @@ private fun CleanActivityRow(
     val skipped = !event.skippedReason.isNullOrBlank()
     val dotColor = when {
         skipped -> c.orange
+        event.action == CleanupAction.STOP_USER -> c.indigo
         event.action == CleanupAction.FORCE_STOP -> c.red
         event.action == CleanupAction.SOFT_TRIM -> c.blue
         else -> c.green
@@ -230,7 +231,10 @@ private fun CleanActivityRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        if (event.packageName.isNotBlank() && event.packageName != "*") {
+        if (event.packageName.isNotBlank() &&
+            event.packageName != "*" &&
+            !event.packageName.startsWith("user:")
+        ) {
             AppIconAvatar(packageName = event.packageName, label = event.appLabel, size = 38.dp)
         } else {
             Box(

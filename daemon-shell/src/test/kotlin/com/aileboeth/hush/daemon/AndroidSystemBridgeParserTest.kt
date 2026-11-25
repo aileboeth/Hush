@@ -105,4 +105,69 @@ class AndroidSystemBridgeParserTest {
         assertTrue(AndroidSystemBridge.isPushProcess("com.example.chat:MSF"))
         assertFalse(AndroidSystemBridge.isPushProcess("com.example.chat:appbrand1"))
     }
+
+    @Test
+    fun parsesPmListUsersAndSecondaryUserMemoryTotals() {
+        val pmOut = """
+            Users:
+            	UserInfo{0:机主:c13} running
+            	UserInfo{10:cys:410} running
+            	UserInfo{11:访客:414}
+            	UserInfo{999:应用分身:1010} running
+        """.trimIndent()
+        val users = AndroidSystemBridge.parsePmListUsers(pmOut)
+        assertEquals(4, users.size)
+        assertEquals(0, users[0].userId)
+        assertTrue(users[0].running)
+        assertEquals(10, users[1].userId)
+        assertEquals("cys", users[1].name)
+        assertEquals(0x410, users[1].flags)
+        assertTrue(users[1].running)
+        assertEquals(11, users[2].userId)
+        assertFalse(users[2].running)
+        assertEquals(999, users[3].userId)
+
+        val memOut = """
+            Total PSS by process:
+              500,000K: com.example.main (pid 1000)                         (  100,000K in swap)
+              300,000K: com.bbk.launcher2 (pid 25145)                       (   80,000K in swap)
+              250,000K: com.android.settings (pid 32666)                    (   40,000K in swap)
+              180,000K: com.tencent.mm (pid 10472) (user 999)               (   30,000K in swap)
+            Total PSS by OOM adjustment:
+        """.trimIndent()
+        val psOut = """
+            USER           PID
+            u0_a100       1000
+            u10_a134     25145
+            u10_system   32666
+            u999_a210    10472
+        """.trimIndent()
+        val pidUsers = AndroidSystemBridge.parsePsPidUsers(psOut)
+        assertFalse(pidUsers.containsKey(1000))
+        assertEquals(10, pidUsers[25145])
+        assertEquals(10, pidUsers[32666])
+        assertEquals(999, pidUsers[10472])
+
+        // OriginOS omits `(user 10)` in `dumpsys meminfo -S`: PID join resolves exact PSS + Swap!
+        val memTotals = AndroidSystemBridge.parseMeminfoUserTotals(memOut, pidToUserId = pidUsers)
+        assertFalse(memTotals.containsKey(0))
+        assertEquals(550_000L, memTotals[10]?.totalPssKb)
+        assertEquals(120_000L, memTotals[10]?.swapPssKb)
+        assertEquals(2, memTotals[10]?.processCount)
+        assertEquals(180_000L, memTotals[999]?.totalPssKb)
+
+        // User 0 batch meminfo must ALSO exclude PID-joined user-10 processes!
+        val user0Batch = AndroidSystemBridge.parseBatchMeminfo(memOut, targetUserId = 0, pidToUserId = pidUsers)
+        assertEquals(500_000L, user0Batch["com.example.main"]?.totalPssKb)
+        assertFalse(user0Batch.containsKey("com.bbk.launcher2"))
+        assertFalse(user0Batch.containsKey("com.android.settings"))
+
+        val disabled = AndroidSystemBridge.parsePmPackageLines(
+            """
+            package:com.vivo.magazine
+            package:com.example.bloat
+            """.trimIndent(),
+        )
+        assertEquals(setOf("com.vivo.magazine", "com.example.bloat"), disabled)
+    }
 }

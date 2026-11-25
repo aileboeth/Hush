@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.Uri
 import android.provider.Settings
 import android.util.LruCache
 import androidx.compose.animation.animateColorAsState
@@ -207,6 +208,7 @@ fun actionLabel(action: CleanupAction): String = when (action) {
     CleanupAction.SOFT_TRIM -> "保消息瘦身"
     CleanupAction.RESTRICT_CHANGED -> "限制变更"
     CleanupAction.RESTORE_ALL -> "一键还原"
+    CleanupAction.STOP_USER -> "停机休眠"
 }
 
 // --- Android Platform Helpers ---
@@ -241,6 +243,14 @@ fun openAppNotificationSettings(context: Context) {
     }
     runCatching { context.startActivity(intent) }
 }
+
+fun openExternalUrl(context: Context, url: String): Boolean = runCatching {
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    context.startActivity(intent)
+    true
+}.getOrDefault(false)
 
 fun isWifiConnected(context: Context): Boolean {
     val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false

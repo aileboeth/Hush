@@ -16,6 +16,9 @@
     <!-- Optional: notification RemoteInput for entering the 6-digit wireless debugging pairing code -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Optional: in-app self-update APK installation from official GitHub Releases -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <application
         android:name=".HushApplication"
         android:allowBackup="false"
@@ -39,6 +42,16 @@
         <receiver
             android:name="com.aileboeth.hush.bootstrap.PairingNotificationReceiver"
             android:exported="false" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

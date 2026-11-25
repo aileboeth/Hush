@@ -12,6 +12,7 @@ interface GuardController {
     val managedApps: StateFlow<List<ManagedAppInfo>>
     val policyConfig: StateFlow<PolicyConfig>
     val cleanupLogs: StateFlow<List<CleanupEvent>>
+    val secondaryUsers: StateFlow<List<SecondaryUserInfo>>
 
     /** Attempt to reconnect to a running daemon using persisted session credentials. */
     suspend fun reconnect(): Result<Unit>
@@ -39,6 +40,15 @@ interface GuardController {
 
     /** Clear the local cleanup history log. */
     suspend fun clearLogs(): Result<Unit>
+
+    /** Immediately stop a background secondary Android user (`am stop-user -w -f <userId>`). Returns freed KB. */
+    suspend fun stopSecondaryUser(userId: Int): Result<Long>
+
+    /** Fetch merged diagnostic logs from both local app process and running daemon (if online). */
+    suspend fun fetchDiagnostics(): Result<List<DiagnosticLogEntry>>
+
+    /** Clear both local app diagnostic logs and running daemon diagnostic buffer. */
+    suspend fun clearDiagnostics(): Result<Unit>
 
     /** Gracefully terminate the running `uid=2000` daemon process. */
     suspend fun stopDaemon(): Result<Unit>

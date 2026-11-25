@@ -7,9 +7,11 @@ import com.aileboeth.hush.contract.AppRuntimeSample
 import com.aileboeth.hush.contract.CleanupAction
 import com.aileboeth.hush.contract.CleanupEvent
 import com.aileboeth.hush.contract.CleanupTrigger
+import com.aileboeth.hush.contract.HushLog
 import com.aileboeth.hush.contract.MemoryOverview
 import com.aileboeth.hush.contract.PolicyConfig
 import com.aileboeth.hush.contract.SafetyGuardrails
+import com.aileboeth.hush.contract.SecondaryUserInfo
 import java.util.Calendar
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
@@ -28,6 +30,8 @@ class PolicyEngine(
     private var config: AppConfigSnapshot = initialConfig
 
     private var currentForegroundPkg: String? = null
+    private var lastObservedUserId: Int = 0
+    private val secondaryUserLeftMs = ConcurrentHashMap<Int, Long>()
     private val lastForegroundMs = ConcurrentHashMap<String, Long>()
     private val lastSoftTrimMs = ConcurrentHashMap<String, Long>()
     private var screenOffSinceMs: Long? = null
@@ -60,7 +64,9 @@ class PolicyEngine(
         var freedKb = 0L
         for (e in eventLog) {
             if (e.timestampMs >= dayStart &&
-                (e.action == CleanupAction.FORCE_STOP || e.action == CleanupAction.SOFT_TRIM) &&
+                (e.action == CleanupAction.FORCE_STOP ||
+                    e.action == CleanupAction.SOFT_TRIM ||
+                    e.action == CleanupAction.STOP_USER) &&
                 e.skippedReason == null
             ) {
                 count++
@@ -73,8 +79,19 @@ class PolicyEngine(
     fun tick() {
         val snap = config
         val now = bridge.nowMs()
+        val currentUser = bridge.getCurrentUserId()
         val fg = bridge.getForegroundPackage()
         val awake = bridge.isScreenAwake()
+
+        if (currentUser != lastObservedUserId) {
+            if (lastObservedUserId > 0) {
+                secondaryUserLeftMs[lastObservedUserId] = now
+            }
+            if (currentUser > 0) {
+                secondaryUserLeftMs.remove(currentUser)
+            }
+            lastObservedUserId = currentUser
+        }
 
         if (fg != null) {
             if (currentForegroundPkg != null && currentForegroundPkg != fg) {
@@ -95,6 +112,9 @@ class PolicyEngine(
         }
 
         if (!snap.policy.enabled) return
+
+        // Always evaluate secondary Android user auto-stop even when zero user-0 apps are tagged
+        evaluateSecondaryUsers(snap.policy, currentUser, awake, now)
 
         val managedEntries = snap.appGroups.filterValues {
             it == AppGroup.FORCE_STOP || it == AppGroup.SOFT_TRIM
@@ -218,7 +238,10 @@ class PolicyEngine(
             return Result.failure(SecurityException("保消息瘦身档与保护档不允许限制后台，以防漏消息"))
         }
         val ok = bridge.applyRestriction(packageName, restriction, userId = 0)
-        if (!ok) return Result.failure(IllegalStateException("修改 $packageName 的后台限制失败"))
+        if (!ok) {
+            val reason = bridge.lastRestrictionError() ?: "修改 $packageName 的后台限制失败"
+            return Result.failure(IllegalStateException(reason))
+        }
 
         if (restriction.hasAnyRestriction) {
             restrictionLedger[packageName] = restriction
@@ -265,6 +288,101 @@ class PolicyEngine(
     }
 
     fun readMemory(): MemoryOverview = bridge.readMemoryOverview()
+
+    fun listSecondaryUsers(): List<SecondaryUserInfo> = bridge.listSecondaryUsers()
+
+    fun manualStopUser(userId: Int): Result<Long> {
+        if (userId <= 0) {
+            return Result.failure(SecurityException("主系统用户受保护，不能停机"))
+        }
+        if (bridge.getCurrentUserId() == userId) {
+            return Result.failure(IllegalStateException("当前正处于该空间中，请先切回主系统"))
+        }
+        val target = bridge.listSecondaryUsers().firstOrNull { it.userId == userId }
+        if (target != null && !target.running) {
+            secondaryUserLeftMs.remove(userId)
+            return Result.success(0L)
+        }
+        val memBefore = bridge.readMemoryOverview()
+        val ok = bridge.stopUser(userId)
+        if (!ok) {
+            HushLog.w("Policy", "manualStopUser($userId) failed")
+            return Result.failure(IllegalStateException("停机第二系统 (User $userId) 失败"))
+        }
+        secondaryUserLeftMs.remove(userId)
+        val memAfter = bridge.readMemoryOverview()
+        val deltaAvail = (memAfter.memAvailableKb - memBefore.memAvailableKb).coerceAtLeast(0L)
+        val freedKb = maxOf(deltaAvail, target?.totalPssKb ?: 0L)
+        val displayName = target?.name?.ifBlank { "User $userId" } ?: "User $userId"
+        HushLog.i("Policy", "Stopped secondary user=$userId ($displayName) freedKb=$freedKb trigger=MANUAL")
+        recordEvent(
+            packageName = "user:$userId",
+            appLabel = "第二系统 · $displayName",
+            action = CleanupAction.STOP_USER,
+            trigger = CleanupTrigger.MANUAL,
+            freedKb = freedKb,
+        )
+        return Result.success(freedKb)
+    }
+
+    private fun evaluateSecondaryUsers(
+        policy: PolicyConfig,
+        currentUser: Int,
+        awake: Boolean,
+        now: Long,
+    ) {
+        if (!policy.autoStopSecondaryUsers && !policy.screenOffStopSecondaryUsers) return
+        val users = bridge.listSecondaryUsers()
+        if (users.isEmpty()) {
+            secondaryUserLeftMs.clear()
+            return
+        }
+        val offSince = screenOffSinceMs
+        for (u in users) {
+            if (!u.running) {
+                secondaryUserLeftMs.remove(u.userId)
+                continue
+            }
+            // Auto-stop strictly targets full secondary systems, never user 0, active user, clone 999, or Work Profile
+            if (!u.canStop || u.userId == currentUser || !u.isFullSecondarySystem) continue
+
+            if (!awake &&
+                policy.screenOffStopSecondaryUsers &&
+                offSince != null &&
+                (now - offSince) >= policy.screenOffDelayMinutes * 60_000L
+            ) {
+                executeAutoStopUser(u, CleanupTrigger.SCREEN_OFF, now)
+                continue
+            }
+
+            if (policy.autoStopSecondaryUsers) {
+                val leftAt = secondaryUserLeftMs.putIfAbsent(u.userId, now) ?: now
+                val delayMs = policy.secondaryUserStopDelayMinutes * 60_000L
+                if (now - leftAt >= delayMs) {
+                    executeAutoStopUser(u, CleanupTrigger.BACKGROUND_TIMEOUT, now)
+                }
+            }
+        }
+    }
+
+    private fun executeAutoStopUser(user: SecondaryUserInfo, trigger: CleanupTrigger, now: Long) {
+        val memBefore = bridge.readMemoryOverview()
+        if (!bridge.stopUser(user.userId)) return
+        secondaryUserLeftMs.remove(user.userId)
+        val memAfter = bridge.readMemoryOverview()
+        val deltaAvail = (memAfter.memAvailableKb - memBefore.memAvailableKb).coerceAtLeast(0L)
+        val freedKb = maxOf(deltaAvail, user.totalPssKb)
+        val displayName = user.name.ifBlank { "User ${user.userId}" }
+        HushLog.i("Policy", "Auto-stopped secondary user=${user.userId} ($displayName) freedKb=$freedKb trigger=$trigger")
+        recordEvent(
+            packageName = "user:${user.userId}",
+            appLabel = "第二系统 · $displayName",
+            action = CleanupAction.STOP_USER,
+            trigger = trigger,
+            freedKb = freedKb,
+            timestampMs = now,
+        )
+    }
 
     private fun runBatchCleanup(
         targets: Map<String, AppGroup>,
@@ -396,6 +514,7 @@ class PolicyEngine(
         freedKb: Long,
         skippedReason: String? = null,
         timestampMs: Long = bridge.nowMs(),
+        appLabel: String = packageName,
     ) {
         synchronized(lock) {
             if (eventLog.size >= MAX_LOG_ENTRIES) {
@@ -406,7 +525,7 @@ class PolicyEngine(
                     id = eventIdGen.getAndIncrement(),
                     timestampMs = timestampMs,
                     packageName = packageName,
-                    appLabel = packageName,
+                    appLabel = appLabel,
                     action = action,
                     trigger = trigger,
                     freedKb = freedKb,

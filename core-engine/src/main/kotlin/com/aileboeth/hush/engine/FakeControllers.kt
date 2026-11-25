@@ -9,13 +9,16 @@ import com.aileboeth.hush.contract.CleanupAction
 import com.aileboeth.hush.contract.CleanupEvent
 import com.aileboeth.hush.contract.CleanupTrigger
 import com.aileboeth.hush.contract.DaemonStatus
+import com.aileboeth.hush.contract.DiagnosticLogEntry
 import com.aileboeth.hush.contract.GuardController
 import com.aileboeth.hush.contract.HushGraph
+import com.aileboeth.hush.contract.HushLog
 import com.aileboeth.hush.contract.HushProtocol
 import com.aileboeth.hush.contract.ManagedAppInfo
 import com.aileboeth.hush.contract.MemoryOverview
 import com.aileboeth.hush.contract.PolicyConfig
 import com.aileboeth.hush.contract.SafetyGuardrails
+import com.aileboeth.hush.contract.SecondaryUserInfo
 import com.aileboeth.hush.contract.StandbyBucket
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -191,6 +194,21 @@ class FakeGuardController : GuardController {
     )
     override val cleanupLogs: StateFlow<List<CleanupEvent>> = _cleanupLogs.asStateFlow()
 
+    private val _secondaryUsers = MutableStateFlow(
+        listOf(
+            SecondaryUserInfo(
+                userId = 10,
+                name = "第二空间示例",
+                running = true,
+                isCurrent = false,
+                processCount = 48,
+                totalPssKb = 840_000L,
+                swapPssKb = 520_000L,
+            ),
+        )
+    )
+    override val secondaryUsers: StateFlow<List<SecondaryUserInfo>> = _secondaryUsers.asStateFlow()
+
     override suspend fun reconnect(): Result<Unit> {
         _daemonStatus.value = DaemonStatus.Connecting
         delay(250)
@@ -274,6 +292,10 @@ class FakeGuardController : GuardController {
             list.map {
                 if (it.packageName == packageName) {
                     it.copy(
+                        running = if (restriction.disableApp) false else it.running,
+                        totalPssKb = if (restriction.disableApp) 0L else it.totalPssKb,
+                        swapPssKb = if (restriction.disableApp) 0L else it.swapPssKb,
+                        processCount = if (restriction.disableApp) 0 else it.processCount,
                         restriction = restriction,
                         standbyBucket = if (restriction.restrictedBucket) StandbyBucket.RESTRICTED else StandbyBucket.ACTIVE,
                     )
@@ -298,6 +320,52 @@ class FakeGuardController : GuardController {
 
     override suspend fun clearLogs(): Result<Unit> {
         _cleanupLogs.value = emptyList()
+        return Result.success(Unit)
+    }
+
+    override suspend fun stopSecondaryUser(userId: Int): Result<Long> {
+        if (userId <= 0) return Result.failure(SecurityException("主系统用户受保护"))
+        val target = _secondaryUsers.value.firstOrNull { it.userId == userId }
+            ?: return Result.failure(IllegalArgumentException("未找到该副系统空间"))
+        if (!target.running) return Result.success(0L)
+        val freed = target.totalPssKb
+        _secondaryUsers.update { list ->
+            list.map {
+                if (it.userId == userId) {
+                    it.copy(running = false, processCount = 0, totalPssKb = 0L, swapPssKb = 0L)
+                } else it
+            }
+        }
+        _memoryOverview.update {
+            it.copy(
+                memAvailableKb = (it.memAvailableKb + freed).coerceAtMost(it.memTotalKb),
+                swapFreeKb = (it.swapFreeKb + target.swapPssKb).coerceAtMost(it.swapTotalKb),
+                sampledAtMs = System.currentTimeMillis(),
+            )
+        }
+        val event = CleanupEvent(
+            id = idGen.getAndIncrement(),
+            timestampMs = System.currentTimeMillis(),
+            packageName = "user:$userId",
+            appLabel = "第二系统 · ${target.name}",
+            action = CleanupAction.STOP_USER,
+            trigger = CleanupTrigger.MANUAL,
+            freedKb = freed,
+        )
+        _cleanupLogs.update { listOf(event) + it }
+        return Result.success(freed)
+    }
+
+    override suspend fun fetchDiagnostics(): Result<List<DiagnosticLogEntry>> {
+        val sample = listOf(
+            DiagnosticLogEntry(now - 90_000L, "I", "daemon", "DaemonMain", "Hush preview daemon ready on port 41892"),
+            DiagnosticLogEntry(now - 30_000L, "I", "app", "Guard", "Snapshot refreshed (preview mode)"),
+        )
+        return Result.success((sample + HushLog.snapshot()).sortedBy { it.timestampMs })
+    }
+
+    override suspend fun clearDiagnostics(): Result<Unit> {
+        HushLog.clear()
         return Result.success(Unit)
     }
 

@@ -3,6 +3,7 @@ package com.aileboeth.hush.bootstrap
 import android.content.Context
 import com.aileboeth.hush.contract.BootstrapController
 import com.aileboeth.hush.contract.BootstrapState
+import com.aileboeth.hush.contract.HushLog
 import com.aileboeth.hush.contract.HushProtocol
 import com.aileboeth.hush.contract.SafetyGuardrails
 import kotlinx.coroutines.CoroutineScope
@@ -150,6 +151,7 @@ class WirelessBootstrapController(
             }
             res.fold(
                 onSuccess = {
+                    HushLog.i("Bootstrap", "Wireless ADB paired successfully on $resolvedHost:$port")
                     _hasPairedBefore.value = true
                     _state.value = BootstrapState.Paired(resolvedHost)
                     pairingNotificationActive = false
@@ -158,6 +160,7 @@ class WirelessBootstrapController(
                     Result.success(Unit)
                 },
                 onFailure = { err ->
+                    HushLog.w("Bootstrap", "Wireless ADB pairing failed on $resolvedHost:$port", err)
                     val errMsg = "配对失败：${err.message ?: "请检查配对码是否正确"}"
                     _state.value = BootstrapState.Error(errMsg, err.stackTraceToString())
                     PairingNotificationReceiver.showPairingPrompt(
@@ -246,6 +249,7 @@ class WirelessBootstrapController(
                     }
                     attach.fold(
                         onSuccess = {
+                            HushLog.i("Bootstrap", "Daemon launched and attached on loopback port=$boundPort")
                             stopDiscovery()
                             _state.value = BootstrapState.Ready(
                                 port = boundPort,
@@ -254,12 +258,14 @@ class WirelessBootstrapController(
                             Result.success(Unit)
                         },
                         onFailure = { err ->
+                            HushLog.e("Bootstrap", "Daemon started on port=$boundPort but attach failed", err)
                             _state.value = BootstrapState.Error("守护进程已启动但连接失败：${err.message}")
                             Result.failure(err)
                         },
                     )
                 },
                 onFailure = { err ->
+                    HushLog.e("Bootstrap", "Wireless ADB launch failed on $targetHost:$targetPort", err)
                     _state.value = BootstrapState.Error("连接无线调试失败：${err.message}", err.stackTraceToString())
                     Result.failure(err)
                 },

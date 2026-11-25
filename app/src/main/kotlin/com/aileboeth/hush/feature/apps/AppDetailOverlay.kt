@@ -118,6 +118,7 @@ fun AppDetailOverlay(
     val closeLatest by rememberUpdatedState(onClose)
 
     var showSoftTrimKillConfirm by remember { mutableStateOf(false) }
+    var showDisableDisclaimerConfirm by remember { mutableStateOf(false) }
     var pull by remember { mutableFloatStateOf(0f) }
     var dismissed by remember { mutableStateOf(false) }
     val restrictionBlocked = SafetyGuardrails.isRestrictionBlocked(app.packageName, app.group)
@@ -426,6 +427,7 @@ fun AppDetailOverlay(
                                 DetailStatCell(
                                     label = "进程状态",
                                     value = when {
+                                        app.restriction.disableApp -> "已停用"
                                         app.isPlayingAudio -> "${app.processCount} · 音频"
                                         app.isFrozen -> "${app.processCount} · 冻结"
                                         app.running -> "${app.processCount} · 运行"
@@ -635,6 +637,21 @@ fun AppDetailOverlay(
                                             onUpdateRestriction(app.restriction.copy(restrictedBucket = it))
                                         },
                                     )
+                                    AppleInsetDivider()
+                                    DetailSwitchRow(
+                                        title = "彻底停用应用（高风险）",
+                                        subtitle = "pm disable-user · 彻底阻止系统与锁屏拉起，随时可恢复",
+                                        checked = app.restriction.disableApp,
+                                        enabled = isDaemonOnline && !isBusy,
+                                        activeColor = c.red,
+                                        onCheckedChange = { enableDisable ->
+                                            if (enableDisable) {
+                                                showDisableDisclaimerConfirm = true
+                                            } else {
+                                                onUpdateRestriction(app.restriction.copy(disableApp = false))
+                                            }
+                                        },
+                                    )
                                 }
                             }
                         }
@@ -680,6 +697,20 @@ fun AppDetailOverlay(
             },
         )
     }
+
+    if (showDisableDisclaimerConfirm) {
+        AppleConfirmDialog(
+            title = "高风险 · 停用「${app.label}」？",
+            message = "停用后系统与锁屏将无法再拉起此应用（可彻底阻止阅图锁屏等组件复活）。\n\n免责声明：请勿停用你不了解用途的系统组件，因自行停用系统应用导致的功能异常需由使用者自行承担责任。你可随时在此页或策略页「一键还原全部限制」中一键恢复。",
+            confirmText = "已知风险，停用",
+            destructive = true,
+            onDismiss = { showDisableDisclaimerConfirm = false },
+            onConfirm = {
+                showDisableDisclaimerConfirm = false
+                onUpdateRestriction(app.restriction.copy(disableApp = true))
+            },
+        )
+    }
 }
 
 private const val PULL_DISMISS_THRESHOLD = 0.16f
@@ -689,10 +720,11 @@ private const val PULL_FLING_VELOCITY_PX = 1400f
 private fun buildDetailStatusChips(app: ManagedAppInfo): List<Triple<String, Color, Color>> {
     val c = HushTheme.colors
     return buildList {
+        if (app.restriction.disableApp) add(Triple("已停用", c.red, c.redSoft))
         if (app.isPlayingAudio) add(Triple("音频播放中", c.purple, c.purple.copy(alpha = if (c.isDark) 0.24f else 0.12f)))
         if (app.isFrozen) add(Triple("已冻结", c.indigo, c.indigoSoft))
         if (app.running && !app.isFrozen && !app.isPlayingAudio) add(Triple("运行中", c.green, c.greenSoft))
-        if (app.restriction.hasAnyRestriction) add(Triple("已限后台", c.orange, c.orangeSoft))
+        if (app.restriction.hasAnyRestriction && !app.restriction.disableApp) add(Triple("已限后台", c.orange, c.orangeSoft))
         if (app.isDualSpace) add(Triple("双开", c.blue, c.blueSoft))
         if (app.isSystemProtected) add(Triple("系统保护", c.textSecondary, c.neutralSoft))
     }
@@ -739,6 +771,7 @@ private fun DetailSwitchRow(
     checked: Boolean,
     enabled: Boolean,
     onCheckedChange: (Boolean) -> Unit,
+    activeColor: Color = HushTheme.colors.green,
 ) {
     val c = HushTheme.colors
     Row(
@@ -763,6 +796,7 @@ private fun DetailSwitchRow(
             checked = checked,
             onCheckedChange = onCheckedChange,
             enabled = enabled,
+            activeColor = activeColor,
         )
     }
 }
@@ -775,6 +809,7 @@ private fun IosToggleSwitch(
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
     enabled: Boolean = true,
+    activeColor: Color = HushTheme.colors.green,
 ) {
     val c = HushTheme.colors
     val haptic = LocalHapticFeedback.current
@@ -782,7 +817,7 @@ private fun IosToggleSwitch(
     val onChangeLatest by rememberUpdatedState(onCheckedChange)
 
     val trackColor by animateColorAsState(
-        targetValue = if (checked) c.green else c.trackBg,
+        targetValue = if (checked) activeColor else c.trackBg,
         animationSpec = tween(200),
         label = "iosSwitchTrack",
     )

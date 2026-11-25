@@ -21,6 +21,10 @@ object HushProtocol {
     const val METHOD_RESTORE_ALL = "restore_all"
     const val METHOD_GET_LOGS = "get_logs"
     const val METHOD_CLEAR_LOGS = "clear_logs"
+    const val METHOD_GET_SECONDARY_USERS = "get_secondary_users"
+    const val METHOD_STOP_USER = "stop_user"
+    const val METHOD_GET_DIAGNOSTICS = "get_diagnostics"
+    const val METHOD_CLEAR_DIAGNOSTICS = "clear_diagnostics"
     const val METHOD_SHUTDOWN = "shutdown"
 
     fun encodePolicy(p: PolicyConfig): Map<String, Any?> = mapOf(
@@ -34,6 +38,9 @@ object HushProtocol {
         "minAvailableRamMb" to p.minAvailableRamMb,
         "pollIntervalSeconds" to p.pollIntervalSeconds,
         "softTrimIncludeDualSpace" to p.softTrimIncludeDualSpace,
+        "autoStopSecondaryUsers" to p.autoStopSecondaryUsers,
+        "secondaryUserStopDelayMinutes" to p.secondaryUserStopDelayMinutes,
+        "screenOffStopSecondaryUsers" to p.screenOffStopSecondaryUsers,
     )
 
     fun decodePolicy(m: Map<String, Any?>): PolicyConfig = PolicyConfig(
@@ -41,24 +48,29 @@ object HushProtocol {
         backgroundTimeoutMinutes = m.intVal("backgroundTimeoutMinutes", 3).coerceIn(1, 120),
         exemptActiveAudio = m.boolVal("exemptActiveAudio", true),
         screenOffCleanupEnabled = m.boolVal("screenOffCleanupEnabled", true),
-        screenOffDelayMinutes = m.intVal("screenOffDelayMinutes", 2).coerceIn(1, 60),
+        screenOffDelayMinutes = m.intVal("screenOffDelayMinutes", 2).coerceIn(0, 60),
         memoryPressureEnabled = m.boolVal("memoryPressureEnabled", true),
         managedBudgetMb = m.intVal("managedBudgetMb", 1024).coerceIn(256, 8192),
         minAvailableRamMb = m.intVal("minAvailableRamMb", 1280).coerceIn(512, 8192),
         pollIntervalSeconds = m.intVal("pollIntervalSeconds", 30).coerceIn(10, 300),
         softTrimIncludeDualSpace = m.boolVal("softTrimIncludeDualSpace", false),
+        autoStopSecondaryUsers = m.boolVal("autoStopSecondaryUsers", true),
+        secondaryUserStopDelayMinutes = m.intVal("secondaryUserStopDelayMinutes", 1).coerceIn(0, 30),
+        screenOffStopSecondaryUsers = m.boolVal("screenOffStopSecondaryUsers", true),
     )
 
     fun encodeRestriction(r: AppRestriction): Map<String, Any?> = mapOf(
         "restrictBackground" to r.restrictBackground,
         "restrictWakeLock" to r.restrictWakeLock,
         "restrictedBucket" to r.restrictedBucket,
+        "disableApp" to r.disableApp,
     )
 
     fun decodeRestriction(m: Map<String, Any?>): AppRestriction = AppRestriction(
         restrictBackground = m.boolVal("restrictBackground", false),
         restrictWakeLock = m.boolVal("restrictWakeLock", false),
         restrictedBucket = m.boolVal("restrictedBucket", false),
+        disableApp = m.boolVal("disableApp", false),
     )
 
     fun encodeMemory(m: MemoryOverview): Map<String, Any?> = mapOf(
@@ -161,6 +173,46 @@ object HushProtocol {
         standbyBucket = runCatching { StandbyBucket.valueOf(m.str("standbyBucket")) }
             .getOrDefault(StandbyBucket.UNKNOWN),
         lastForegroundMs = m.longVal("lastForegroundMs"),
+    )
+
+    fun encodeSecondaryUser(u: SecondaryUserInfo): Map<String, Any?> = mapOf(
+        "userId" to u.userId,
+        "name" to u.name,
+        "running" to u.running,
+        "isCurrent" to u.isCurrent,
+        "processCount" to u.processCount,
+        "totalPssKb" to u.totalPssKb,
+        "swapPssKb" to u.swapPssKb,
+        "isManagedProfile" to u.isManagedProfile,
+        "isCloneProfile" to u.isCloneProfile,
+    )
+
+    fun decodeSecondaryUser(m: Map<String, Any?>): SecondaryUserInfo = SecondaryUserInfo(
+        userId = m.intVal("userId", 0),
+        name = m.str("name"),
+        running = m.boolVal("running", false),
+        isCurrent = m.boolVal("isCurrent", false),
+        processCount = m.intVal("processCount", 0),
+        totalPssKb = m.longVal("totalPssKb"),
+        swapPssKb = m.longVal("swapPssKb"),
+        isManagedProfile = m.boolVal("isManagedProfile", false),
+        isCloneProfile = m.boolVal("isCloneProfile", false),
+    )
+
+    fun encodeDiagnosticEntry(e: DiagnosticLogEntry): Map<String, Any?> = mapOf(
+        "timestampMs" to e.timestampMs,
+        "level" to e.level,
+        "source" to e.source,
+        "tag" to e.tag,
+        "message" to e.message,
+    )
+
+    fun decodeDiagnosticEntry(m: Map<String, Any?>): DiagnosticLogEntry = DiagnosticLogEntry(
+        timestampMs = m.longVal("timestampMs"),
+        level = m.str("level", "I"),
+        source = m.str("source", "daemon"),
+        tag = m.str("tag", "Hush"),
+        message = m.str("message"),
     )
 }
 

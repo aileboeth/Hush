@@ -49,6 +49,7 @@ import androidx.compose.ui.unit.sp
 import com.aileboeth.hush.contract.AppGroup
 import com.aileboeth.hush.contract.DaemonStatus
 import com.aileboeth.hush.contract.ManagedAppInfo
+import com.aileboeth.hush.contract.SecondaryUserInfo
 import com.aileboeth.hush.design.AppIconAvatar
 import com.aileboeth.hush.design.AppleGroupedCard
 import com.aileboeth.hush.design.AppleInsetDivider
@@ -145,6 +146,7 @@ fun OverviewScreen(
     onOpenAppDetail: (String) -> Unit,
     onQuickForceStop: (String, String) -> Unit,
     onQuickSoftTrim: (String, String) -> Unit,
+    onStopSecondaryUser: (SecondaryUserInfo) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val c = HushTheme.colors
@@ -480,6 +482,46 @@ fun OverviewScreen(
                 }
             }
 
+            // 3.5 Multi-User Secondary Space Card (only shown when device has secondary Android users)
+            if (uiState.secondaryUsers.isNotEmpty()) {
+                item(key = "secondary_users") {
+                    val runningCount = uiState.secondaryUsers.count { it.running }
+                    Column(
+                        modifier = Modifier.staggeredCascade(2, stagger),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text("多用户空间", style = HushType.sectionTitle, color = c.textPrimary)
+                            Text(
+                                text = if (runningCount > 0) "$runningCount 个运行中" else "全部已休眠",
+                                style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                                color = if (runningCount > 0) c.orange else c.textTertiary,
+                            )
+                        }
+
+                        AppleGroupedCard {
+                            uiState.secondaryUsers.forEachIndexed { idx, user ->
+                                SecondaryUserRow(
+                                    user = user,
+                                    isOnline = isOnline,
+                                    isBusy = user.userId in uiState.busyUserIds,
+                                    onStopUser = { onStopSecondaryUser(user) },
+                                )
+                                if (idx < uiState.secondaryUsers.lastIndex) {
+                                    AppleInsetDivider(startIndent = 68.dp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // 4. Clean iOS Grouped Card: Active Focus Apps (safe tier-aware actions — never red kill on UNSET!)
             val focusApps = uiState.managedApps
                 .filter { it.totalPssKb > 0L || it.running }
@@ -489,7 +531,7 @@ fun OverviewScreen(
             if (focusApps.isNotEmpty()) {
                 item(key = "focus_apps") {
                     Column(
-                        modifier = Modifier.staggeredCascade(2, stagger),
+                        modifier = Modifier.staggeredCascade(if (uiState.secondaryUsers.isNotEmpty()) 3 else 2, stagger),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Row(
@@ -787,6 +829,134 @@ private fun FocusAppRow(
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SecondaryUserRow(
+    user: SecondaryUserInfo,
+    isOnline: Boolean,
+    isBusy: Boolean,
+    onStopUser: () -> Unit,
+) {
+    val c = HushTheme.colors
+    val kindBadge = when {
+        user.isCloneProfile -> "双开 · #${user.userId}"
+        user.isManagedProfile -> "工作资料 · #${user.userId}"
+        else -> "第二系统 · #${user.userId}"
+    }
+    val accent = when {
+        !user.running -> c.textTertiary
+        user.isFullSecondarySystem -> c.indigo
+        else -> c.blue
+    }
+    val softBg = when {
+        !user.running -> c.neutralSoft
+        user.isFullSecondarySystem -> c.indigoSoft
+        else -> c.blueSoft
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 13.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(40.dp)
+                .clip(RoundedCornerShape(11.dp))
+                .background(softBg),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = HushIcons.Layers,
+                contentDescription = null,
+                tint = accent,
+                modifier = Modifier.size(19.dp),
+            )
+        }
+
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    text = user.name,
+                    style = HushType.cardTitle,
+                    color = c.textPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = kindBadge,
+                    style = HushType.micro.copy(fontSize = 10.5.sp, fontWeight = FontWeight.Medium),
+                    color = accent,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(softBg)
+                        .padding(horizontal = 6.dp, vertical = 1.5.dp),
+                )
+            }
+            val subtitle = if (user.running) {
+                buildString {
+                    if (user.processCount > 0) append("${user.processCount} 进程")
+                    if (user.totalPssKb > 0L) {
+                        if (isNotEmpty()) append(" · ")
+                        append("占用 ${formatMemoryKb(user.totalPssKb)}")
+                    }
+                    if (isEmpty()) append("后台运行中")
+                }
+            } else {
+                "已彻底休眠 · 0 内存占用"
+            }
+            Text(
+                text = subtitle,
+                style = HushType.micro,
+                color = if (user.running) c.textSecondary else c.textTertiary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
+        when {
+            isOnline && user.canStop -> {
+                FocusActionPill(
+                    label = "立即停机",
+                    bgColor = c.redSoft,
+                    fgColor = c.red,
+                    isBusy = isBusy,
+                    onClick = onStopUser,
+                )
+            }
+            user.isCurrent -> {
+                Text(
+                    text = "当前空间",
+                    style = HushType.micro.copy(fontWeight = FontWeight.SemiBold),
+                    color = c.blue,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(100.dp))
+                        .background(c.blueSoft)
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                )
+            }
+            else -> {
+                Text(
+                    text = "已休眠",
+                    style = HushType.micro.copy(fontWeight = FontWeight.SemiBold),
+                    color = c.textTertiary,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(100.dp))
+                        .background(c.neutralSoft)
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                )
             }
         }
     }

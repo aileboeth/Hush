@@ -1,5 +1,6 @@
 package com.aileboeth.hush.engine
 
+import com.aileboeth.hush.contract.HushLog
 import com.aileboeth.hush.contract.HushProtocol
 import com.aileboeth.hush.contract.MiniJson
 import com.aileboeth.hush.contract.boolVal
@@ -39,7 +40,9 @@ class DaemonClient {
             runCatching {
                 openAndAuthLocked(port, token)
                 session = DaemonSession(port, token)
-            }.onFailure {
+                HushLog.i("DaemonClient", "Connected to loopback daemon port=$port")
+            }.onFailure { err ->
+                HushLog.w("DaemonClient", "Connect failed on port=$port", err)
                 closeLocked()
                 session = null
             }
@@ -71,7 +74,8 @@ class DaemonClient {
                         throw IllegalStateException(resp.str("error", "守护进程返回错误"))
                     }
                     resp
-                }.onFailure {
+                }.onFailure { err ->
+                    HushLog.w("DaemonClient", "RPC call '$method' failed", err)
                     closeLocked()
                 }
             }

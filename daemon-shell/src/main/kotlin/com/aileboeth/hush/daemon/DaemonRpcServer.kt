@@ -1,7 +1,9 @@
 package com.aileboeth.hush.daemon
 
+import com.aileboeth.hush.contract.HushLog
 import com.aileboeth.hush.contract.HushProtocol
 import com.aileboeth.hush.contract.MiniJson
+import com.aileboeth.hush.contract.intVal
 import com.aileboeth.hush.contract.obj
 import com.aileboeth.hush.contract.str
 import java.io.BufferedReader
@@ -84,6 +86,7 @@ class DaemonRpcServer(
         } catch (_: IOException) {
             // Normal client disconnect / broken pipe
         } catch (t: Throwable) {
+            HushLog.w("RpcServer", "RPC client error", t)
             System.err.println("HUSH_DAEMON_WARN: rpc client error: ${t.javaClass.simpleName}: ${t.message}")
         } finally {
             runCatching { socket.close() }
@@ -100,6 +103,7 @@ class DaemonRpcServer(
         val authObj = runCatching { MiniJson.parseObject(authLine) }.getOrNull() ?: return
         val provided = authObj.str("token")
         if (!constantTimeEquals(authToken, provided)) {
+            HushLog.w("RpcServer", "Rejected invalid handshake token")
             writeLine(writer, mapOf("ok" to false, "error" to "鉴权失败：无效的会话令牌"))
             return
         }
@@ -213,11 +217,43 @@ class DaemonRpcServer(
                     mapOf("ok" to true)
                 }
 
-                HushProtocol.METHOD_SHUTDOWN -> mapOf("ok" to true, "__shutdown__" to true)
+                HushProtocol.METHOD_GET_SECONDARY_USERS -> mapOf(
+                    "ok" to true,
+                    "data" to mapOf(
+                        "users" to engine.listSecondaryUsers().map(HushProtocol::encodeSecondaryUser),
+                    ),
+                )
+
+                HushProtocol.METHOD_STOP_USER -> {
+                    val userId = params.intVal("userId", -1)
+                    val res = engine.manualStopUser(userId)
+                    res.fold(
+                        onSuccess = { freed -> mapOf("ok" to true, "data" to mapOf("freedKb" to freed)) },
+                        onFailure = { err -> mapOf("ok" to false, "error" to (err.message ?: "停机副系统失败")) },
+                    )
+                }
+
+                HushProtocol.METHOD_GET_DIAGNOSTICS -> mapOf(
+                    "ok" to true,
+                    "data" to mapOf(
+                        "entries" to HushLog.snapshot().map(HushProtocol::encodeDiagnosticEntry),
+                    ),
+                )
+
+                HushProtocol.METHOD_CLEAR_DIAGNOSTICS -> {
+                    HushLog.clear()
+                    mapOf("ok" to true)
+                }
+
+                HushProtocol.METHOD_SHUTDOWN -> {
+                    HushLog.i("RpcServer", "Shutdown requested via RPC")
+                    mapOf("ok" to true, "__shutdown__" to true)
+                }
 
                 else -> mapOf("ok" to false, "error" to "未知指令：$method")
             }
         } catch (t: Throwable) {
+            HushLog.e("RpcServer", "Unhandled RPC exception for method=$method", t)
             mapOf("ok" to false, "error" to "执行异常：${t.message ?: t.javaClass.simpleName}")
         }
     }

@@ -5,9 +5,12 @@ import com.aileboeth.hush.contract.BootstrapState
 import com.aileboeth.hush.contract.CleanupAction
 import com.aileboeth.hush.contract.CleanupEvent
 import com.aileboeth.hush.contract.DaemonStatus
+import com.aileboeth.hush.contract.DiagnosticLogEntry
 import com.aileboeth.hush.contract.ManagedAppInfo
 import com.aileboeth.hush.contract.MemoryOverview
 import com.aileboeth.hush.contract.PolicyConfig
+import com.aileboeth.hush.contract.SecondaryUserInfo
+import com.aileboeth.hush.update.UpdateState
 
 enum class HushTab(val label: String) {
     OVERVIEW("总览"),
@@ -62,12 +65,14 @@ data class HushUiState(
     val memoryOverview: MemoryOverview = MemoryOverview(),
     val memoryHistory: List<MemorySamplePoint> = emptyList(),
     val managedApps: List<ManagedAppInfo> = emptyList(),
+    val secondaryUsers: List<SecondaryUserInfo> = emptyList(),
     val policyConfig: PolicyConfig = PolicyConfig(),
     val cleanupLogs: List<CleanupEvent> = emptyList(),
     val bootstrapState: BootstrapState = BootstrapState.Idle,
     val hasPairedBefore: Boolean = false,
     val usbFallbackCommand: String = "",
     val busyPackages: Set<String> = emptySet(),
+    val busyUserIds: Set<Int> = emptySet(),
     val isGlobalActionBusy: Boolean = false,
     // Apps screen state
     val appFilter: AppFilterMode = AppFilterMode.ALL,
@@ -76,6 +81,13 @@ data class HushUiState(
     val selectedAppPackage: String? = null,
     // Activity bottom sheet filter
     val activityFilter: ActivityFilterMode = ActivityFilterMode.ALL,
+    // Self-updater, disclaimer & diagnostic logs state
+    val updateState: UpdateState = UpdateState.Idle,
+    val showUpdateDialog: Boolean = false,
+    val showDisclaimerDialog: Boolean = false,
+    val showDiagnosticsSheet: Boolean = false,
+    val isDiagnosticsLoading: Boolean = false,
+    val diagnosticLogs: List<DiagnosticLogEntry> = emptyList(),
 ) {
     val selectedApp: ManagedAppInfo?
         get() = selectedAppPackage?.let { pkg -> managedApps.firstOrNull { it.packageName == pkg } }
@@ -125,7 +137,9 @@ data class HushUiState(
         get() = cleanupLogs.filter { ev ->
             when (activityFilter) {
                 ActivityFilterMode.ALL -> true
-                ActivityFilterMode.FORCE_STOP -> ev.action == CleanupAction.FORCE_STOP && ev.skippedReason == null
+                ActivityFilterMode.FORCE_STOP ->
+                    (ev.action == CleanupAction.FORCE_STOP || ev.action == CleanupAction.STOP_USER) &&
+                        ev.skippedReason == null
                 ActivityFilterMode.SOFT_TRIM -> ev.action == CleanupAction.SOFT_TRIM && ev.skippedReason == null
                 ActivityFilterMode.SKIPPED -> !ev.skippedReason.isNullOrBlank()
             }

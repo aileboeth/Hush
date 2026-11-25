@@ -1,13 +1,20 @@
 package com.aileboeth.hush.state
 
 import android.content.Context
+import com.aileboeth.hush.BuildConfig
 import com.aileboeth.hush.contract.AppGroup
 import com.aileboeth.hush.contract.AppRestriction
 import com.aileboeth.hush.contract.DaemonStatus
 import com.aileboeth.hush.contract.HushGraph
+import com.aileboeth.hush.contract.HushLog
 import com.aileboeth.hush.contract.MemoryOverview
 import com.aileboeth.hush.contract.PolicyConfig
+import com.aileboeth.hush.contract.SecondaryUserInfo
 import com.aileboeth.hush.design.formatMemoryKb
+import com.aileboeth.hush.update.AppUpdater
+import com.aileboeth.hush.update.ReleaseInfo
+import com.aileboeth.hush.update.UpdateState
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -28,6 +35,7 @@ class HushStore(
     context: Context,
     private val graph: HushGraph,
 ) {
+    private val appContext = context.applicationContext
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
@@ -50,10 +58,12 @@ class HushStore(
     private var isForegrounded = true
     private var livePollJob: Job? = null
     private var policyDebounceJob: Job? = null
+    private var updateDownloadJob: Job? = null
 
     init {
         observeControllers()
         startInitialConnect()
+        startSilentUpdateCheck()
     }
 
     private fun observeControllers() {
@@ -84,6 +94,12 @@ class HushStore(
                     livePollJob?.cancel()
                     livePollJob = null
                 }
+            }
+        }
+
+        scope.launch {
+            guard.secondaryUsers.collect { users ->
+                _uiState.update { it.copy(secondaryUsers = users) }
             }
         }
 
@@ -328,12 +344,20 @@ class HushStore(
 
     fun setAppRestriction(packageName: String, restriction: AppRestriction) {
         if (packageName in _uiState.value.busyPackages) return
+        val prev = _uiState.value.managedApps.firstOrNull { it.packageName == packageName }?.restriction
         scope.launch {
             _uiState.update { it.copy(busyPackages = it.busyPackages + packageName) }
             val res = guard.setAppRestriction(packageName, restriction)
             _uiState.update { it.copy(busyPackages = it.busyPackages - packageName) }
             res.fold(
-                onSuccess = { notify("后台限制已更新") },
+                onSuccess = {
+                    val msg = when {
+                        restriction.disableApp && prev?.disableApp != true -> "已停用应用，系统将不再拉起"
+                        !restriction.disableApp && prev?.disableApp == true -> "已恢复启用应用"
+                        else -> "后台限制已更新"
+                    }
+                    notify(msg)
+                },
                 onFailure = { err -> notify(err.message ?: "更新限制失败", isError = true) },
             )
         }
@@ -374,6 +398,22 @@ class HushStore(
             res.fold(
                 onSuccess = { notify("已清空清理记录") },
                 onFailure = { err -> notify(err.message ?: "清空失败", isError = true) },
+            )
+        }
+    }
+
+    fun stopSecondaryUser(user: SecondaryUserInfo) {
+        if (user.userId in _uiState.value.busyUserIds) return
+        scope.launch {
+            _uiState.update { it.copy(busyUserIds = it.busyUserIds + user.userId) }
+            val res = guard.stopSecondaryUser(user.userId)
+            _uiState.update { it.copy(busyUserIds = it.busyUserIds - user.userId) }
+            res.fold(
+                onSuccess = { freedKb ->
+                    val detail = if (freedKb > 0L) " · 释放 ${formatMemoryKb(freedKb)}" else ""
+                    notify("已彻底停机「${user.name}」$detail")
+                },
+                onFailure = { err -> notify(err.message ?: "停机第二系统失败", isError = true) },
             )
         }
     }
@@ -429,7 +469,164 @@ class HushStore(
         }
     }
 
+    fun openDisclaimerDialog() {
+        _uiState.update { it.copy(showDisclaimerDialog = true) }
+    }
+
+    fun closeDisclaimerDialog() {
+        _uiState.update { it.copy(showDisclaimerDialog = false) }
+    }
+
+    fun openUpdateDialog() {
+        _uiState.update { it.copy(showUpdateDialog = true) }
+    }
+
+    fun closeUpdateDialog() {
+        _uiState.update { it.copy(showUpdateDialog = false) }
+    }
+
+    private fun startSilentUpdateCheck() {
+        if (graph.isPreviewMode) return
+        scope.launch {
+            delay(2_500L)
+            checkForUpdates(silent = true)
+        }
+    }
+
+    fun checkForUpdates(silent: Boolean = false) {
+        val current = _uiState.value.updateState
+        if (current is UpdateState.Checking || current is UpdateState.Downloading) return
+        scope.launch {
+            if (!silent) {
+                _uiState.update { it.copy(updateState = UpdateState.Checking) }
+            }
+            val res = AppUpdater.checkLatestRelease(BuildConfig.VERSION_NAME)
+            res.fold(
+                onSuccess = { latest ->
+                    if (latest != null) {
+                        val lastPrompted = prefs.getString(KEY_LAST_PROMPTED_VERSION, null)
+                        val shouldPop = !silent || lastPrompted != latest.versionName
+                        if (shouldPop) {
+                            prefs.edit().putString(KEY_LAST_PROMPTED_VERSION, latest.versionName).apply()
+                        }
+                        _uiState.update {
+                            it.copy(
+                                updateState = UpdateState.Available(latest),
+                                showUpdateDialog = it.showUpdateDialog || shouldPop,
+                            )
+                        }
+                        if (!silent) {
+                            notify("发现新版本 v${latest.versionName}")
+                        }
+                    } else {
+                        _uiState.update { it.copy(updateState = UpdateState.UpToDate(BuildConfig.VERSION_NAME)) }
+                        if (!silent) {
+                            notify("当前已是最新版本 v${BuildConfig.VERSION_NAME}")
+                        }
+                    }
+                },
+                onFailure = { err ->
+                    if (!silent) {
+                        val msg = err.message ?: "无法连接 GitHub，请稍后重试"
+                        _uiState.update { it.copy(updateState = UpdateState.Error(msg)) }
+                        notify("检查更新失败：$msg", isError = true)
+                    }
+                },
+            )
+        }
+    }
+
+    fun startUpdateDownload(release: ReleaseInfo) {
+        if (_uiState.value.updateState is UpdateState.Downloading) return
+        updateDownloadJob?.cancel()
+        updateDownloadJob = scope.launch {
+            _uiState.update {
+                it.copy(
+                    updateState = UpdateState.Downloading(release, 0L, release.apkSizeBytes),
+                    showUpdateDialog = true,
+                )
+            }
+            val res = AppUpdater.downloadApk(appContext, release) { downloaded, total ->
+                _uiState.update { cur ->
+                    if (cur.updateState is UpdateState.Downloading) {
+                        cur.copy(updateState = UpdateState.Downloading(release, downloaded, total))
+                    } else cur
+                }
+            }
+            res.fold(
+                onSuccess = { apkFile ->
+                    _uiState.update {
+                        it.copy(updateState = UpdateState.ReadyToInstall(release, apkFile.absolutePath))
+                    }
+                    installDownloadedUpdate()
+                },
+                onFailure = { err ->
+                    val msg = err.message ?: "下载安装包失败"
+                    _uiState.update { it.copy(updateState = UpdateState.Error(msg, release)) }
+                    notify("下载失败：$msg", isError = true)
+                },
+            )
+        }
+    }
+
+    fun cancelUpdateDownload() {
+        val current = _uiState.value.updateState
+        updateDownloadJob?.cancel()
+        updateDownloadJob = null
+        if (current is UpdateState.Downloading) {
+            _uiState.update { it.copy(updateState = UpdateState.Available(current.release)) }
+            notify("已取消更新下载")
+        }
+    }
+
+    fun installDownloadedUpdate() {
+        val ready = _uiState.value.updateState as? UpdateState.ReadyToInstall ?: return
+        AppUpdater.launchApkInstaller(appContext, File(ready.apkPath)).fold(
+            onSuccess = { openedInstaller ->
+                if (!openedInstaller) {
+                    notify("请先开启「允许安装未知应用」，返回后再点立即安装")
+                }
+            },
+            onFailure = { err ->
+                notify(err.message ?: "唤起安装器失败", isError = true)
+            },
+        )
+    }
+
+    fun openDiagnosticsSheet() {
+        _uiState.update { it.copy(showDiagnosticsSheet = true) }
+        refreshDiagnostics()
+    }
+
+    fun closeDiagnosticsSheet() {
+        _uiState.update { it.copy(showDiagnosticsSheet = false) }
+    }
+
+    fun refreshDiagnostics() {
+        scope.launch {
+            _uiState.update { it.copy(isDiagnosticsLoading = true) }
+            val res = guard.fetchDiagnostics()
+            _uiState.update { cur ->
+                cur.copy(
+                    isDiagnosticsLoading = false,
+                    diagnosticLogs = res.getOrDefault(HushLog.snapshot()),
+                )
+            }
+        }
+    }
+
+    fun clearDiagnostics() {
+        scope.launch {
+            guard.clearDiagnostics()
+            _uiState.update { it.copy(diagnosticLogs = emptyList()) }
+            notify("已清空诊断日志")
+        }
+    }
+
     fun notify(message: String, isError: Boolean = false) {
+        if (isError) {
+            HushLog.w("Notice", message)
+        }
         _notices.tryEmit(HushNotice(message, isError))
     }
 
@@ -450,6 +647,7 @@ class HushStore(
     companion object {
         private const val PREFS_NAME = "hush_ui_prefs"
         private const val KEY_THEME = "theme_preference"
+        private const val KEY_LAST_PROMPTED_VERSION = "last_prompted_update_version"
         private const val LIVE_POLL_INTERVAL_MS = 8_000L
         private const val MAX_HISTORY_POINTS = 24
     }

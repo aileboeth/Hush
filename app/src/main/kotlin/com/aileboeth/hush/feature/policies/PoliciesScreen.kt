@@ -43,6 +43,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -58,9 +59,12 @@ import com.aileboeth.hush.design.HushType
 import com.aileboeth.hush.design.OdometerText
 import com.aileboeth.hush.design.applePressScale
 import com.aileboeth.hush.design.formatMemoryMb
+import com.aileboeth.hush.design.openExternalUrl
 import com.aileboeth.hush.design.rememberStaggerClock
 import com.aileboeth.hush.design.staggeredCascade
 import com.aileboeth.hush.state.HushUiState
+import com.aileboeth.hush.update.AppUpdater
+import com.aileboeth.hush.update.UpdateState
 import kotlin.math.roundToInt
 
 /**
@@ -75,9 +79,14 @@ fun PoliciesScreen(
     onRestoreAllRestrictions: () -> Unit,
     onOpenActivation: () -> Unit,
     onStopDaemon: () -> Unit,
+    onCheckUpdates: () -> Unit = {},
+    onOpenUpdateDialog: () -> Unit = {},
+    onOpenDisclaimer: () -> Unit = {},
+    onOpenDiagnostics: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val c = HushTheme.colors
+    val context = LocalContext.current
     val policy = uiState.policyConfig
     val isRunning = uiState.daemonStatus is DaemonStatus.Running
     val stagger = rememberStaggerClock()
@@ -252,10 +261,50 @@ fun PoliciesScreen(
             }
         }
 
+        // Section 3.5: Multi-User Secondary Space Auto-Stop
+        item(key = "secondary_spaces") {
+            Column(
+                modifier = Modifier.staggeredCascade(3, stagger),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                SectionCaption("多用户空间")
+                AppleGroupedCard {
+                    AppleSwitchRow(
+                        title = "离开第二系统自动停机",
+                        subtitle = "切回主系统后彻底关闭后台第二系统，释放全部内存",
+                        checked = policy.autoStopSecondaryUsers,
+                        onCheckedChange = { onUpdatePolicy(policy.copy(autoStopSecondaryUsers = it), true) },
+                    )
+                    AnimatedVisibility(visible = policy.autoStopSecondaryUsers) {
+                        Column {
+                            AppleInsetDivider()
+                            AppleSliderRow(
+                                label = "离开停机延迟",
+                                valueText = if (policy.secondaryUserStopDelayMinutes == 0) "立即" else "${policy.secondaryUserStopDelayMinutes} 分钟",
+                                value = policy.secondaryUserStopDelayMinutes.toFloat(),
+                                valueRange = 0f..15f,
+                                steps = 14,
+                                onValueChange = {
+                                    onUpdatePolicy(policy.copy(secondaryUserStopDelayMinutes = it.roundToInt()), false)
+                                },
+                            )
+                        }
+                    }
+                    AppleInsetDivider()
+                    AppleSwitchRow(
+                        title = "息屏自动停机第二系统",
+                        subtitle = "锁屏后将后台运行中的第二系统整机休眠（不影响双开分身）",
+                        checked = policy.screenOffStopSecondaryUsers,
+                        onCheckedChange = { onUpdatePolicy(policy.copy(screenOffStopSecondaryUsers = it), true) },
+                    )
+                }
+            }
+        }
+
         // Section 4: Daemon & Safety Actions
         item(key = "daemon_ops") {
             Column(
-                modifier = Modifier.staggeredCascade(3, stagger),
+                modifier = Modifier.staggeredCascade(4, stagger),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 SectionCaption("守护与安全")
@@ -288,8 +337,70 @@ fun PoliciesScreen(
                         onClick = { showStopDialog = true },
                     )
                 }
+            }
+        }
+
+        // Section 5: About, Author GitHub, Auto-Update & Disclaimer
+        item(key = "about_update") {
+            val updateTrailing = when (val u = uiState.updateState) {
+                is UpdateState.Checking -> "检查中…"
+                is UpdateState.Available -> "发现 v${u.release.versionName}"
+                is UpdateState.Downloading -> {
+                    val pct = if (u.progress >= 0f) "${(u.progress * 100).roundToInt()}%" else "下载中"
+                    "下载 $pct"
+                }
+                is UpdateState.ReadyToInstall -> "待安装 v${u.release.versionName}"
+                is UpdateState.UpToDate -> "v${BuildConfig.VERSION_NAME} · 最新"
+                else -> "v${BuildConfig.VERSION_NAME}"
+            }
+            val hasPendingUpdate = uiState.updateState is UpdateState.Available ||
+                uiState.updateState is UpdateState.Downloading ||
+                uiState.updateState is UpdateState.ReadyToInstall
+
+            Column(
+                modifier = Modifier.staggeredCascade(5, stagger),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                SectionCaption("关于与更新")
+                AppleGroupedCard {
+                    AppleNavActionRow(
+                        title = "检查应用更新",
+                        trailing = updateTrailing,
+                        trailingColor = if (hasPendingUpdate) c.blue else c.textTertiary,
+                        onClick = {
+                            if (hasPendingUpdate) {
+                                onOpenUpdateDialog()
+                            } else {
+                                onCheckUpdates()
+                            }
+                        },
+                    )
+                    AppleInsetDivider()
+                    AppleNavActionRow(
+                        title = "作者",
+                        trailing = "${AppUpdater.AUTHOR_NAME} · GitHub",
+                        onClick = { openExternalUrl(context, AppUpdater.AUTHOR_GITHUB_URL) },
+                    )
+                    AppleInsetDivider()
+                    AppleNavActionRow(
+                        title = "开源仓库",
+                        trailing = "aileboeth/Hush",
+                        onClick = { openExternalUrl(context, AppUpdater.REPO_GITHUB_URL) },
+                    )
+                    AppleInsetDivider()
+                    AppleNavActionRow(
+                        title = "诊断日志",
+                        trailing = "查看 / 导出",
+                        onClick = onOpenDiagnostics,
+                    )
+                    AppleInsetDivider()
+                    AppleNavActionRow(
+                        title = "免责声明与安全说明",
+                        onClick = onOpenDisclaimer,
+                    )
+                }
                 Text(
-                    text = "Hush ${BuildConfig.VERSION_NAME} · 零 Root · 本机环回鉴权",
+                    text = "Hush v${BuildConfig.VERSION_NAME} · by ${AppUpdater.AUTHOR_NAME} · 零 Root · 开源透明",
                     style = HushType.micro,
                     color = c.textTertiary,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
@@ -301,7 +412,7 @@ fun PoliciesScreen(
     if (showRestoreDialog) {
         AppleConfirmDialog(
             title = "还原全部后台限制？",
-            message = "将恢复 Hush 写入过的所有 appops 与待机桶修改，不影响你的应用档位配置。",
+            message = "将恢复 Hush 写入过的所有 appops、待机桶修改，并自动重新启用通过 Hush 停用的应用，不影响你的应用档位配置。",
             confirmText = "确认还原",
             destructive = false,
             onDismiss = { showRestoreDialog = false },
@@ -335,6 +446,13 @@ private fun buildFootnote(policy: PolicyConfig): String {
     }
     if (policy.exemptActiveAudio) parts += "音频播放免杀"
     if (policy.memoryPressureEnabled) parts += "可用低于 ${formatMemoryMb(policy.minAvailableRamMb)} 时按 LRU 回收"
+    if (policy.autoStopSecondaryUsers) {
+        parts += if (policy.secondaryUserStopDelayMinutes == 0) {
+            "离开副系统立即停机"
+        } else {
+            "离开副系统 ${policy.secondaryUserStopDelayMinutes} 分钟后停机"
+        }
+    }
     return parts.joinToString(" · ")
 }
 
@@ -491,6 +609,7 @@ private fun AppleNavActionRow(
     onClick: () -> Unit,
     trailing: String? = null,
     titleColor: Color = HushTheme.colors.textPrimary,
+    trailingColor: Color = HushTheme.colors.textTertiary,
     enabled: Boolean = true,
     showChevron: Boolean = true,
 ) {
@@ -513,7 +632,13 @@ private fun AppleNavActionRow(
             horizontalArrangement = Arrangement.spacedBy(5.dp),
         ) {
             if (trailing != null) {
-                Text(text = trailing, style = HushType.caption, color = c.textTertiary)
+                Text(
+                    text = trailing,
+                    style = HushType.caption.copy(
+                        fontWeight = if (trailingColor == c.blue) FontWeight.SemiBold else FontWeight.Normal,
+                    ),
+                    color = trailingColor,
+                )
             }
             if (showChevron) {
                 Icon(

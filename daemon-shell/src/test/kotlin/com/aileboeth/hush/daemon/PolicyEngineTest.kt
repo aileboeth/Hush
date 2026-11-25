@@ -8,6 +8,7 @@ import com.aileboeth.hush.contract.CleanupAction
 import com.aileboeth.hush.contract.CleanupTrigger
 import com.aileboeth.hush.contract.MemoryOverview
 import com.aileboeth.hush.contract.PolicyConfig
+import com.aileboeth.hush.contract.SecondaryUserInfo
 import com.aileboeth.hush.contract.StandbyBucket
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -32,6 +33,9 @@ class PolicyEngineTest {
         val forceStopped = ArrayList<String>()
         val softTrimmed = ArrayList<String>()
         val restrictions = LinkedHashMap<String, AppRestriction>()
+        var activeUserId: Int = 0
+        val secondaryUsers = ArrayList<SecondaryUserInfo>()
+        val stoppedUsers = ArrayList<Int>()
 
         override fun nowMs(): Long = timeMs
         override fun currentPid(): Int = 4242
@@ -83,6 +87,23 @@ class PolicyEngineTest {
             val r = restrictions[packageName] ?: AppRestriction()
             val b = if (r.restrictedBucket) StandbyBucket.RESTRICTED else StandbyBucket.ACTIVE
             return r to b
+        }
+
+        override fun getCurrentUserId(): Int = activeUserId
+
+        override fun listSecondaryUsers(): List<SecondaryUserInfo> =
+            secondaryUsers.map { it.copy(isCurrent = it.userId == activeUserId) }
+
+        override fun stopUser(userId: Int): Boolean {
+            if (userId <= 0 || userId == activeUserId) return false
+            stoppedUsers.add(userId)
+            val idx = secondaryUsers.indexOfFirst { it.userId == userId }
+            if (idx >= 0) {
+                val u = secondaryUsers[idx]
+                memory = memory.copy(memAvailableKb = memory.memAvailableKb + u.totalPssKb)
+                secondaryUsers[idx] = u.copy(running = false, processCount = 0, totalPssKb = 0L, swapPssKb = 0L)
+            }
+            return true
         }
     }
 
@@ -234,13 +255,91 @@ class PolicyEngineTest {
 
         val allowed = engine.setRestriction(
             "com.example.shop",
-            AppRestriction(restrictBackground = true, restrictWakeLock = true, restrictedBucket = true),
+            AppRestriction(restrictBackground = true, restrictWakeLock = true, restrictedBucket = true, disableApp = true),
         )
         assertTrue(allowed.isSuccess)
         assertTrue(bridge.restrictions["com.example.shop"]?.hasAnyRestriction == true)
+        assertTrue(bridge.restrictions["com.example.shop"]?.disableApp == true)
+
+        // Critical installer package must always be blocked from disabling/restricting
+        assertTrue(
+            engine.setRestriction(
+                "com.android.packageinstaller",
+                AppRestriction(disableApp = true),
+            ).isFailure,
+        )
 
         val restored = engine.restoreAllRestrictions()
         assertEquals(1, restored.getOrThrow())
         assertFalse(bridge.restrictions["com.example.shop"]?.hasAnyRestriction == true)
+        assertFalse(bridge.restrictions["com.example.shop"]?.disableApp == true)
+    }
+
+    @Test
+    fun autoStopsFullSecondarySystemAfterLeaveDelayWhileProtectingActiveAndCloneUsers() {
+        val bridge = FakeBridge()
+        bridge.secondaryUsers.addAll(
+            listOf(
+                SecondaryUserInfo(
+                    userId = 10,
+                    name = "cys",
+                    running = true,
+                    processCount = 51,
+                    totalPssKb = 840_000L,
+                    swapPssKb = 600_000L,
+                ),
+                SecondaryUserInfo(
+                    userId = 999,
+                    name = "应用分身",
+                    running = true,
+                    processCount = 4,
+                    totalPssKb = 180_000L,
+                    isCloneProfile = true,
+                ),
+            ),
+        )
+        val engine = PolicyEngine(
+            bridge = bridge,
+            initialConfig = AppConfigSnapshot(
+                // Deliberately ZERO managed apps to prove secondary-user stop works standalone!
+                appGroups = emptyMap(),
+                policy = PolicyConfig(
+                    enabled = true,
+                    autoStopSecondaryUsers = true,
+                    secondaryUserStopDelayMinutes = 2,
+                    screenOffStopSecondaryUsers = true,
+                ),
+            ),
+        )
+
+        // While user is actively inside User 10 -> MUST NOT stop it
+        bridge.activeUserId = 10
+        engine.tick()
+        bridge.timeMs += 5 * 60_000L
+        engine.tick()
+        assertTrue(bridge.stoppedUsers.isEmpty())
+        assertTrue(engine.manualStopUser(10).isFailure)
+        assertTrue(engine.manualStopUser(0).isFailure)
+
+        // User switches back to primary (User 0) -> starts 2-minute countdown
+        bridge.activeUserId = 0
+        engine.tick()
+        bridge.timeMs += 60_000L // only 1 minute -> still waiting
+        engine.tick()
+        assertTrue(bridge.stoppedUsers.isEmpty())
+
+        // 2 minutes elapsed -> User 10 stopped cleanly, User 999 clone untouched!
+        bridge.timeMs += 65_000L
+        engine.tick()
+        assertEquals(listOf(10), bridge.stoppedUsers)
+        assertTrue(bridge.secondaryUsers.first { it.userId == 999 }.running)
+
+        val log = engine.getLogs().firstOrNull()
+        assertEquals(CleanupAction.STOP_USER, log?.action)
+        assertEquals("第二系统 · cys", log?.appLabel)
+        assertEquals(840_000L, log?.freedKb)
+        val (todayCount, todayFreed) = engine.getTodayStats()
+        assertEquals(1, todayCount)
+        assertEquals(840_000L, todayFreed)
     }
 }
