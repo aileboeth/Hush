@@ -23,7 +23,6 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlin.math.sin
 
 class HushStore(
     context: Context,
@@ -48,6 +47,7 @@ class HushStore(
     val notices: SharedFlow<HushNotice> = _notices.asSharedFlow()
 
     private var initialAutoConnectDone = false
+    private var isForegrounded = true
     private var livePollJob: Job? = null
     private var policyDebounceJob: Job? = null
 
@@ -78,7 +78,7 @@ class HushStore(
                         cleanupLogs = snap.logs,
                     )
                 }
-                if (snap.status is DaemonStatus.Running) {
+                if (snap.status is DaemonStatus.Running && isForegrounded) {
                     ensureLivePolling()
                 } else {
                     livePollJob?.cancel()
@@ -113,27 +113,18 @@ class HushStore(
         val availMb = overview.memAvailableKb / 1024f
         val usedMb = overview.memUsedKb / 1024f
         val swapMb = overview.swapUsedKb / 1024f
+        val sample = MemorySamplePoint(
+            timestampMs = now,
+            availableMb = availMb,
+            usedMb = usedMb,
+            swapUsedMb = swapMb,
+        )
 
-        // Seed an organic initial timeline on first sample so the scrub chart is immediately alive
-        if (current.isEmpty()) {
-            val totalMb = (overview.memTotalKb / 1024f).coerceAtLeast(1024f)
-            return (8 downTo 0).map { offset ->
-                val ts = now - offset * 60_000L
-                val wave = if (offset == 0) 0f else (sin(offset * 0.85) * 95.0 - offset * 14.0).toFloat()
-                val seededAvail = (availMb + wave).coerceIn(totalMb * 0.08f, totalMb * 0.92f)
-                val seededUsed = (totalMb - seededAvail).coerceAtLeast(0f)
-                MemorySamplePoint(
-                    timestampMs = ts,
-                    availableMb = seededAvail,
-                    usedMb = seededUsed,
-                    swapUsedMb = (swapMb - wave * 0.35f).coerceAtLeast(0f),
-                )
-            }
-        }
+        if (current.isEmpty()) return listOf(sample)
 
         val last = current.last()
         if (now <= last.timestampMs) return current
-        return (current + MemorySamplePoint(now, availMb, usedMb, swapMb)).takeLast(MAX_HISTORY_POINTS)
+        return (current + sample).takeLast(MAX_HISTORY_POINTS)
     }
 
     private fun startInitialConnect() {
@@ -150,21 +141,36 @@ class HushStore(
     }
 
     private fun ensureLivePolling() {
-        if (livePollJob?.isActive == true) return
+        if (!isForegrounded || livePollJob?.isActive == true) return
         livePollJob = scope.launch {
-            while (isActive) {
+            while (isActive && isForegrounded) {
                 delay(LIVE_POLL_INTERVAL_MS)
-                if (_uiState.value.daemonStatus is DaemonStatus.Running && !_uiState.value.isRefreshing) {
+                if (isForegrounded && _uiState.value.daemonStatus is DaemonStatus.Running && !_uiState.value.isRefreshing) {
                     guard.refreshSnapshot()
                 }
             }
         }
     }
 
+    fun setForegrounded(foregrounded: Boolean) {
+        if (isForegrounded == foregrounded) return
+        isForegrounded = foregrounded
+        if (foregrounded) {
+            if (_uiState.value.daemonStatus is DaemonStatus.Running) {
+                ensureLivePolling()
+            }
+        } else {
+            livePollJob?.cancel()
+            livePollJob = null
+        }
+    }
+
     fun onAppForegrounded() {
+        isForegrounded = true
         val status = _uiState.value.daemonStatus
         scope.launch {
             if (status is DaemonStatus.Running) {
+                ensureLivePolling()
                 guard.refreshSnapshot()
             } else if (!_uiState.value.isReconnecting) {
                 guard.reconnect()
@@ -191,14 +197,23 @@ class HushStore(
         notify("外观：${next.label}")
     }
 
-    fun openActivationPanel() {
-        _uiState.update { it.copy(showActivationPanel = true) }
+    fun openStatusPopover() {
+        _uiState.update { it.copy(showStatusPopover = true) }
+    }
+
+    fun closeStatusPopover() {
+        _uiState.update { it.copy(showStatusPopover = false) }
+    }
+
+    fun openActivationSheet() {
+        _uiState.update { it.copy(showStatusPopover = false, showActivationSheet = true) }
         bootstrap.startDiscovery()
     }
 
-    fun closeActivationPanel() {
+    fun closeActivationSheet() {
         bootstrap.stopDiscovery()
-        _uiState.update { it.copy(showActivationPanel = false) }
+        bootstrap.dismissPairingNotification()
+        _uiState.update { it.copy(showActivationSheet = false) }
         if (_uiState.value.daemonStatus is DaemonStatus.Running) {
             refreshSnapshot(silent = true)
         }
@@ -435,7 +450,7 @@ class HushStore(
     companion object {
         private const val PREFS_NAME = "hush_ui_prefs"
         private const val KEY_THEME = "theme_preference"
-        private const val LIVE_POLL_INTERVAL_MS = 12_000L
-        private const val MAX_HISTORY_POINTS = 16
+        private const val LIVE_POLL_INTERVAL_MS = 8_000L
+        private const val MAX_HISTORY_POINTS = 24
     }
 }

@@ -370,6 +370,16 @@ object HushIcons {
         }
     }
 
+    val ChevronLeft: ImageVector by lazy {
+        strokeIcon("ChevronLeft") {
+            strokePath {
+                moveTo(14.5f, 6.5f)
+                lineTo(9f, 12f)
+                lineTo(14.5f, 17.5f)
+            }
+        }
+    }
+
     val ChevronDown: ImageVector by lazy {
         strokeIcon("ChevronDown") {
             strokePath {

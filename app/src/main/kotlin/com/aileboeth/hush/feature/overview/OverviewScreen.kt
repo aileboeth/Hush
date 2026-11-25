@@ -1,13 +1,9 @@
 package com.aileboeth.hush.feature.overview
 
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.ExperimentalSharedTransitionApi
 import androidx.compose.animation.SharedTransitionScope
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -16,12 +12,15 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -31,6 +30,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -39,6 +40,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -50,21 +53,79 @@ import com.aileboeth.hush.design.AppIconAvatar
 import com.aileboeth.hush.design.AppleGroupedCard
 import com.aileboeth.hush.design.AppleInsetDivider
 import com.aileboeth.hush.design.AppleLuminousTiltCard
+import com.aileboeth.hush.design.AppleMeterBar
 import com.aileboeth.hush.design.ApplePillButton
 import com.aileboeth.hush.design.AppleScrubMemoryChart
 import com.aileboeth.hush.design.BreathingDot
 import com.aileboeth.hush.design.HushIcons
 import com.aileboeth.hush.design.HushTheme
 import com.aileboeth.hush.design.HushType
+import com.aileboeth.hush.design.MorphAnchor
 import com.aileboeth.hush.design.OdometerText
 import com.aileboeth.hush.design.applePressScale
 import com.aileboeth.hush.design.formatClockShort
 import com.aileboeth.hush.design.formatMemoryKb
 import com.aileboeth.hush.design.formatMemoryMbFloat
+import com.aileboeth.hush.design.morphAnchor
+import com.aileboeth.hush.design.rememberStaggerClock
 import com.aileboeth.hush.design.staggeredCascade
-import com.aileboeth.hush.design.tierAccentColor
 import com.aileboeth.hush.state.AppFilterMode
 import com.aileboeth.hush.state.HushUiState
+import java.util.Calendar
+import kotlin.math.roundToInt
+
+/**
+ * Reusable top-right daemon status capsule shared pixel-for-pixel between [OverviewScreen]
+ * and the fluid-morphing status popover in `HushRoot`.
+ */
+@Composable
+fun StatusCapsule(
+    status: DaemonStatus,
+    elevated: Boolean = true,
+    modifier: Modifier = Modifier,
+) {
+    val c = HushTheme.colors
+    val capsuleShape = RoundedCornerShape(100.dp)
+    val dotColor = when (status) {
+        is DaemonStatus.Running -> c.green
+        is DaemonStatus.Connecting -> c.orange
+        is DaemonStatus.Error -> c.red
+        is DaemonStatus.Disconnected -> c.blue
+    }
+    val labelText = when (status) {
+        is DaemonStatus.Running -> "守护运行中"
+        is DaemonStatus.Connecting -> "连接中"
+        is DaemonStatus.Error -> "连接异常"
+        is DaemonStatus.Disconnected -> "无线激活"
+    }
+    val isPulsing = status is DaemonStatus.Running || status is DaemonStatus.Connecting
+
+    Surface(
+        modifier = modifier,
+        shape = capsuleShape,
+        color = if (c.isDark) c.surfaceElevated else c.surface,
+        border = BorderStroke(0.7.dp, c.glassBorder),
+        shadowElevation = if (elevated && !c.isDark) 2.dp else 0.dp,
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 8.dp, end = 13.dp, top = 7.dp, bottom = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            BreathingDot(
+                color = dotColor,
+                isPulsing = isPulsing,
+                size = 7.dp,
+            )
+            Text(
+                text = labelText,
+                style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                color = c.textPrimary,
+                maxLines = 1,
+            )
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalSharedTransitionApi::class)
 @Composable
@@ -72,8 +133,11 @@ fun OverviewScreen(
     uiState: HushUiState,
     sharedTransitionScope: SharedTransitionScope,
     animatedVisibilityScope: AnimatedVisibilityScope,
+    capsuleAnchor: MorphAnchor,
+    capsuleHidden: Boolean,
     onRefresh: () -> Unit,
     onCycleTheme: () -> Unit,
+    onOpenStatusPopover: () -> Unit,
     onOpenActivation: () -> Unit,
     onReconnect: () -> Unit,
     onOpenActivitySheet: () -> Unit,
@@ -86,107 +150,93 @@ fun OverviewScreen(
     val c = HushTheme.colors
     val runningStatus = uiState.daemonStatus as? DaemonStatus.Running
     val isOnline = runningStatus != null
+    val mem = uiState.memoryOverview
+    val stagger = rememberStaggerClock()
+    val refreshState = rememberPullToRefreshState()
+    val statusTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
 
     // Scrubbing state for the interactive Apple Health–style memory line chart
     var scrubbedIndex by remember { mutableStateOf<Int?>(null) }
     val samples = uiState.memoryHistory
     val activeSample = scrubbedIndex?.let { samples.getOrNull(it) } ?: samples.lastOrNull()
+    val todayLine = remember { todayChineseDateLine() }
 
     PullToRefreshBox(
         isRefreshing = uiState.isRefreshing,
         onRefresh = onRefresh,
+        state = refreshState,
+        indicator = {
+            PullToRefreshDefaults.Indicator(
+                state = refreshState,
+                isRefreshing = uiState.isRefreshing,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding(),
+            )
+        },
         modifier = modifier.fillMaxSize(),
     ) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 112.dp),
+            contentPadding = PaddingValues(
+                start = 20.dp,
+                end = 20.dp,
+                top = statusTop + 10.dp,
+                bottom = 120.dp,
+            ),
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
-            // 1. Minimalist Apple Large Title + Fluid Morph Status Capsule
+            // 1. Apple Health–style Date Eyebrow + Large Title + Fluid Morph Status Capsule + Theme Circle
             item(key = "header") {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 6.dp),
+                        .padding(top = 4.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
+                    verticalAlignment = Alignment.Bottom,
                 ) {
-                    Text(
-                        text = "Hush",
-                        style = HushType.largeTitle,
-                        color = c.textPrimary,
-                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                        Text(
+                            text = todayLine,
+                            style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                            color = c.textSecondary,
+                        )
+                        Text(
+                            text = "Hush",
+                            style = HushType.largeTitle,
+                            color = c.textPrimary,
+                        )
+                    }
 
                     Row(
+                        modifier = Modifier.padding(bottom = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        // Fluid Morph Source Capsule -> seamlessly morphs into Activation & Control Panel!
-                        AnimatedVisibility(
-                            visible = !uiState.showActivationPanel,
-                            enter = fadeIn(tween(180)),
-                            exit = fadeOut(tween(140)),
+                        // Morph anchor source for AppleCapsuleMorph compact status popover
+                        Box(
+                            modifier = Modifier
+                                .morphAnchor(capsuleAnchor)
+                                .graphicsLayer { alpha = if (capsuleHidden) 0f else 1f }
+                                .applePressScale(
+                                    enabled = !capsuleHidden,
+                                    cornerRadius = 100.dp,
+                                    onClick = onOpenStatusPopover,
+                                ),
                         ) {
-                            with(sharedTransitionScope) {
-                                val capsuleShape = RoundedCornerShape(100.dp)
-                                val dotColor = when (uiState.daemonStatus) {
-                                    is DaemonStatus.Running -> c.green
-                                    is DaemonStatus.Connecting -> c.orange
-                                    is DaemonStatus.Error -> c.red
-                                    is DaemonStatus.Disconnected -> c.blue
-                                }
-                                val labelText = when (uiState.daemonStatus) {
-                                    is DaemonStatus.Running -> "守护运行中"
-                                    is DaemonStatus.Connecting -> "连接中"
-                                    is DaemonStatus.Error -> "连接异常"
-                                    is DaemonStatus.Disconnected -> "无线激活"
-                                }
-
-                                Surface(
-                                    modifier = Modifier
-                                        .sharedBounds(
-                                            sharedContentState = rememberSharedContentState(key = "activation_fluid_morph"),
-                                            animatedVisibilityScope = this@AnimatedVisibility,
-                                            boundsTransform = { _, _ ->
-                                                spring(dampingRatio = 0.78f, stiffness = 340f)
-                                            },
-                                            clipInOverlayDuringTransition = OverlayClip(capsuleShape),
-                                        )
-                                        .clip(capsuleShape)
-                                        .applePressScale(cornerRadius = 100.dp, onClick = onOpenActivation),
-                                    shape = capsuleShape,
-                                    color = c.surface,
-                                    border = BorderStroke(0.7.dp, c.glassBorder),
-                                    shadowElevation = if (c.isDark) 0.dp else 2.dp,
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(start = 8.dp, end = 13.dp, top = 7.dp, bottom = 7.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(5.dp),
-                                    ) {
-                                        BreathingDot(
-                                            color = dotColor,
-                                            isPulsing = isOnline || uiState.daemonStatus is DaemonStatus.Connecting,
-                                            size = 7.dp,
-                                        )
-                                        Text(
-                                            text = labelText,
-                                            style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
-                                            color = c.textPrimary,
-                                        )
-                                    }
-                                }
-                            }
+                            StatusCapsule(
+                                status = uiState.daemonStatus,
+                                elevated = true,
+                            )
                         }
 
                         // Subtle Apple monochrome theme circle toggle
                         Surface(
                             modifier = Modifier
                                 .size(34.dp)
-                                .clip(CircleShape)
                                 .applePressScale(cornerRadius = 100.dp, onClick = onCycleTheme),
                             shape = CircleShape,
-                            color = c.surface,
+                            color = if (c.isDark) c.surfaceElevated else c.surface,
                             border = BorderStroke(0.7.dp, c.glassBorder),
                             shadowElevation = if (c.isDark) 0.dp else 2.dp,
                         ) {
@@ -203,13 +253,13 @@ fun OverviewScreen(
                 }
             }
 
-            // 2. Signature Hero Card: 3D Perspective Tilt + Touch Sheen + Rotating Conic Glow + Odometer + Scrubbing Chart
+            // 2. Signature Hero Card: Luminous Tilt Card + Mechanical Odometer + Scrubbing Chart + Slim RAM/Swap Bars
             item(key = "hero_card") {
                 AppleLuminousTiltCard(
                     isActive = isOnline,
-                    modifier = Modifier.staggeredCascade(0),
+                    modifier = Modifier.staggeredCascade(0, stagger),
                 ) {
-                    // Top caption & right secondary badge
+                    // Top caption & right ZRAM pill badge
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -225,9 +275,14 @@ fun OverviewScreen(
                             color = c.textSecondary,
                         )
 
-                        if (isOnline && activeSample != null) {
+                        if (isOnline && (activeSample != null || mem.memTotalKb > 0L)) {
+                            val zramText = if (activeSample != null) {
+                                formatMemoryMbFloat(activeSample.swapUsedMb)
+                            } else {
+                                formatMemoryKb(mem.swapUsedKb)
+                            }
                             Text(
-                                text = "ZRAM ${formatMemoryMbFloat(activeSample.swapUsedMb)}",
+                                text = "ZRAM $zramText",
                                 style = HushType.micro.copy(fontWeight = FontWeight.SemiBold),
                                 color = c.blue,
                                 modifier = Modifier
@@ -240,11 +295,11 @@ fun OverviewScreen(
 
                     Spacer(Modifier.height(6.dp))
 
-                    // Rolling Odometer Hero Counter
+                    // Rolling 10-face Mechanical Odometer Hero Counter
                     val heroDisplay = when {
                         !isOnline -> "未连接"
                         activeSample != null -> formatMemoryMbFloat(activeSample.availableMb)
-                        uiState.memoryOverview.memTotalKb > 0L -> formatMemoryKb(uiState.memoryOverview.memAvailableKb)
+                        mem.memTotalKb > 0L -> formatMemoryKb(mem.memAvailableKb)
                         else -> "—"
                     }
                     OdometerText(
@@ -253,9 +308,14 @@ fun OverviewScreen(
                         color = c.textPrimary,
                     )
 
-                    if (isOnline && uiState.memoryOverview.memTotalKb > 0L) {
+                    if (isOnline && mem.memTotalKb > 0L) {
+                        val subtitle = if (samples.size >= 2) {
+                            "已用 ${formatMemoryKb(mem.memUsedKb)} / 总计 ${formatMemoryKb(mem.memTotalKb)} · 左右滑动曲线查看节点"
+                        } else {
+                            "已用 ${formatMemoryKb(mem.memUsedKb)} / 总计 ${formatMemoryKb(mem.memTotalKb)}"
+                        }
                         Text(
-                            text = "已用 ${formatMemoryKb(uiState.memoryOverview.memUsedKb)} / 总计 ${formatMemoryKb(uiState.memoryOverview.memTotalKb)} · 左右滑动曲线查看节点",
+                            text = subtitle,
                             style = HushType.micro,
                             color = c.textTertiary,
                             modifier = Modifier.padding(top = 3.dp),
@@ -271,13 +331,68 @@ fun OverviewScreen(
 
                     Spacer(Modifier.height(14.dp))
 
-                    if (isOnline && samples.size >= 2) {
-                        AppleScrubMemoryChart(
-                            samples = samples,
-                            selectedIndex = scrubbedIndex,
-                            onSelectIndex = { scrubbedIndex = it },
-                            chartHeight = 104.dp,
-                        )
+                    if (isOnline && mem.memTotalKb > 0L) {
+                        if (samples.size >= 2) {
+                            AppleScrubMemoryChart(
+                                samples = samples,
+                                selectedIndex = scrubbedIndex,
+                                onSelectIndex = { scrubbedIndex = it },
+                                chartHeight = 86.dp,
+                            )
+                            Spacer(Modifier.height(12.dp))
+                            // Compact dual slim RAM & ZRAM gauges right below the curve
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            ) {
+                                CompactMemoryMeter(
+                                    label = "物理内存",
+                                    percent = (mem.memUsedFraction * 100f).roundToInt(),
+                                    fraction = mem.memUsedFraction,
+                                    color = c.blue,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                if (mem.swapTotalKb > 0L) {
+                                    CompactMemoryMeter(
+                                        label = "ZRAM",
+                                        percent = (mem.swapUsedFraction * 100f).roundToInt(),
+                                        fraction = mem.swapUsedFraction,
+                                        color = c.indigo,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                }
+                            }
+                        } else {
+                            // Honest cold-start state (< 2 real samples): full slim RAM/Swap bars + live sampling hint
+                            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                StackedMemoryMeter(
+                                    label = "物理内存",
+                                    detail = "${formatMemoryKb(mem.memUsedKb)} / ${formatMemoryKb(mem.memTotalKb)}",
+                                    fraction = mem.memUsedFraction,
+                                    color = c.blue,
+                                )
+                                if (mem.swapTotalKb > 0L) {
+                                    StackedMemoryMeter(
+                                        label = "ZRAM / Swap",
+                                        detail = "${formatMemoryKb(mem.swapUsedKb)} / ${formatMemoryKb(mem.swapTotalKb)}",
+                                        fraction = mem.swapUsedFraction,
+                                        color = c.indigo,
+                                    )
+                                }
+                                Row(
+                                    modifier = Modifier.padding(top = 2.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    BreathingDot(color = c.blue, isPulsing = true, size = 5.5.dp)
+                                    Text(
+                                        text = "实时采样中，曲线将随运行自动绘出",
+                                        style = HushType.micro,
+                                        color = c.textTertiary,
+                                    )
+                                }
+                            }
+                        }
                     } else if (!isOnline) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -338,7 +453,7 @@ fun OverviewScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .staggeredCascade(1),
+                        .staggeredCascade(1, stagger),
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
                     MinimalTierTile(
@@ -365,7 +480,7 @@ fun OverviewScreen(
                 }
             }
 
-            // 4. Clean iOS Grouped Card: Active Focus Apps (tap opens Shared Element Detail!)
+            // 4. Clean iOS Grouped Card: Active Focus Apps (safe tier-aware actions — never red kill on UNSET!)
             val focusApps = uiState.managedApps
                 .filter { it.totalPssKb > 0L || it.running }
                 .sortedByDescending { it.totalPssKb }
@@ -374,7 +489,7 @@ fun OverviewScreen(
             if (focusApps.isNotEmpty()) {
                 item(key = "focus_apps") {
                     Column(
-                        modifier = Modifier.staggeredCascade(2),
+                        modifier = Modifier.staggeredCascade(2, stagger),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Row(
@@ -407,13 +522,8 @@ fun OverviewScreen(
                                     sharedTransitionScope = sharedTransitionScope,
                                     animatedVisibilityScope = animatedVisibilityScope,
                                     onOpenDetail = { onOpenAppDetail(app.packageName) },
-                                    onQuickAction = {
-                                        if (app.group == AppGroup.SOFT_TRIM) {
-                                            onQuickSoftTrim(app.packageName, app.label)
-                                        } else {
-                                            onQuickForceStop(app.packageName, app.label)
-                                        }
-                                    },
+                                    onQuickForceStop = { onQuickForceStop(app.packageName, app.label) },
+                                    onQuickSoftTrim = { onQuickSoftTrim(app.packageName, app.label) },
                                 )
                                 if (idx < focusApps.lastIndex) {
                                     AppleInsetDivider(startIndent = 68.dp)
@@ -424,6 +534,71 @@ fun OverviewScreen(
                 }
             }
         }
+    }
+}
+
+private fun todayChineseDateLine(): String {
+    val cal = Calendar.getInstance()
+    val weekdays = arrayOf("星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六")
+    val dayOfWeek = weekdays[(cal.get(Calendar.DAY_OF_WEEK) - 1).coerceIn(0, 6)]
+    return "${cal.get(Calendar.MONTH) + 1}月${cal.get(Calendar.DAY_OF_MONTH)}日 $dayOfWeek"
+}
+
+@Composable
+private fun CompactMemoryMeter(
+    label: String,
+    percent: Int,
+    fraction: Float,
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    val c = HushTheme.colors
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(text = label, style = HushType.micro, color = c.textSecondary)
+            Text(
+                text = "$percent%",
+                style = HushType.micro.copy(fontWeight = FontWeight.SemiBold, fontFeatureSettings = "tnum"),
+                color = c.textPrimary,
+            )
+        }
+        AppleMeterBar(fraction = fraction, color = color, height = 4.5.dp)
+    }
+}
+
+@Composable
+private fun StackedMemoryMeter(
+    label: String,
+    detail: String,
+    fraction: Float,
+    color: Color,
+) {
+    val c = HushTheme.colors
+    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = label,
+                style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                color = c.textPrimary,
+            )
+            Text(
+                text = detail,
+                style = HushType.micro.copy(fontFeatureSettings = "tnum"),
+                color = c.textSecondary,
+            )
+        }
+        AppleMeterBar(fraction = fraction, color = color, height = 5.5.dp)
     }
 }
 
@@ -459,14 +634,13 @@ private fun HeroInlineStat(
 private fun MinimalTierTile(
     title: String,
     count: Int,
-    dotColor: androidx.compose.ui.graphics.Color,
+    dotColor: Color,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val c = HushTheme.colors
     Surface(
         modifier = modifier
-            .clip(RoundedCornerShape(20.dp))
             .applePressScale(cornerRadius = 20.dp, onClick = onClick),
         shape = RoundedCornerShape(20.dp),
         color = c.surface,
@@ -490,8 +664,8 @@ private fun MinimalTierTile(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            Text(
-                text = "$count",
+            OdometerText(
+                text = count.toString(),
                 style = HushType.metricNumber.copy(fontSize = 22.sp),
                 color = c.textPrimary,
             )
@@ -508,11 +682,10 @@ private fun FocusAppRow(
     sharedTransitionScope: SharedTransitionScope,
     animatedVisibilityScope: AnimatedVisibilityScope,
     onOpenDetail: () -> Unit,
-    onQuickAction: () -> Unit,
+    onQuickForceStop: () -> Unit,
+    onQuickSoftTrim: () -> Unit,
 ) {
     val c = HushTheme.colors
-    val isSoft = app.group == AppGroup.SOFT_TRIM
-    val canAct = isOnline && !app.isSystemProtected && app.group != AppGroup.PROTECTED
 
     with(sharedTransitionScope) {
         Row(
@@ -564,39 +737,89 @@ private fun FocusAppRow(
                 )
             }
 
-            if (canAct) {
-                val pillBg = if (isSoft) c.blueSoft else c.redSoft
-                val pillFg = if (isSoft) c.blue else c.red
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(100.dp))
-                        .background(pillBg)
-                        .applePressScale(enabled = !isBusy, cornerRadius = 100.dp, onClick = onQuickAction)
-                        .padding(horizontal = 13.dp, vertical = 6.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    if (isBusy) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(13.dp),
-                            strokeWidth = 1.8.dp,
-                            color = pillFg,
-                        )
-                    } else {
-                        Text(
-                            text = if (isSoft) "瘦身" else "强杀",
-                            style = HushType.micro.copy(fontWeight = FontWeight.SemiBold),
-                            color = pillFg,
+            // Tier-safe trailing control: NEVER put a red kill button on UNSET / messaging apps!
+            when {
+                isOnline && !app.isSystemProtected && app.group == AppGroup.FORCE_STOP -> {
+                    FocusActionPill(
+                        label = "强杀",
+                        bgColor = c.redSoft,
+                        fgColor = c.red,
+                        isBusy = isBusy,
+                        onClick = onQuickForceStop,
+                    )
+                }
+                isOnline && !app.isSystemProtected && app.group == AppGroup.SOFT_TRIM -> {
+                    FocusActionPill(
+                        label = "瘦身",
+                        bgColor = c.blueSoft,
+                        fgColor = c.blue,
+                        isBusy = isBusy,
+                        onClick = onQuickSoftTrim,
+                    )
+                }
+                !app.isSystemProtected && app.group == AppGroup.UNSET -> {
+                    FocusActionPill(
+                        label = "配置",
+                        bgColor = c.neutralSoft,
+                        fgColor = c.textSecondary,
+                        isBusy = false,
+                        onClick = onOpenDetail,
+                    )
+                }
+                else -> {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    ) {
+                        if (app.group == AppGroup.PROTECTED) {
+                            Box(Modifier.size(6.dp).clip(CircleShape).background(c.indigo))
+                            Text(
+                                text = "保护",
+                                style = HushType.micro.copy(fontWeight = FontWeight.SemiBold),
+                                color = c.indigo,
+                            )
+                        }
+                        Icon(
+                            imageVector = HushIcons.ChevronRight,
+                            contentDescription = null,
+                            tint = c.textTertiary,
+                            modifier = Modifier.size(16.dp),
                         )
                     }
                 }
-            } else {
-                Icon(
-                    imageVector = HushIcons.ChevronRight,
-                    contentDescription = null,
-                    tint = c.textTertiary,
-                    modifier = Modifier.size(16.dp),
-                )
             }
+        }
+    }
+}
+
+@Composable
+private fun FocusActionPill(
+    label: String,
+    bgColor: Color,
+    fgColor: Color,
+    isBusy: Boolean,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(100.dp))
+            .background(bgColor)
+            .applePressScale(enabled = !isBusy, cornerRadius = 100.dp, onClick = onClick)
+            .padding(horizontal = 13.dp, vertical = 6.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (isBusy) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(13.dp),
+                strokeWidth = 1.8.dp,
+                color = fgColor,
+            )
+        } else {
+            Text(
+                text = label,
+                style = HushType.micro.copy(fontWeight = FontWeight.SemiBold),
+                color = fgColor,
+            )
         }
     }
 }

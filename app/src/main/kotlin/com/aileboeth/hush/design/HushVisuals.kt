@@ -12,15 +12,17 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -44,15 +46,29 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -69,6 +85,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 // --- Formatting & Semantic Labels ---
 
@@ -311,6 +328,216 @@ fun ApplePillButton(
     }
 }
 
+/**
+ * Sleek iOS Settings–style slider: thin rounded track + elevated white circular thumb,
+ * tactile haptic detent ticks, smooth tap & drag, and vertical-scroll-friendly gesture arbitration.
+ */
+@Composable
+fun AppleSlider(
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    valueRange: ClosedFloatingPointRange<Float> = 0f..1f,
+    steps: Int = 0,
+    onValueChangeFinished: (() -> Unit)? = null,
+    activeTrackColor: Color = HushTheme.colors.blue,
+    inactiveTrackColor: Color = HushTheme.colors.trackBg,
+) {
+    val haptic = LocalHapticFeedback.current
+    val density = LocalDensity.current
+    val latestOnValueChange by rememberUpdatedState(onValueChange)
+    val latestOnFinished by rememberUpdatedState(onValueChangeFinished)
+
+    val thumbDiameter = 26.dp
+    val thumbPx = with(density) { thumbDiameter.toPx() }
+    var widthPx by remember { mutableFloatStateOf(1f) }
+    var isDragging by remember { mutableStateOf(false) }
+
+    val start = valueRange.start
+    val end = valueRange.endInclusive
+    val span = (end - start).coerceAtLeast(1e-6f)
+    val clamped = value.coerceIn(start, end)
+    val latestClamped by rememberUpdatedState(clamped)
+    val rawFraction = ((clamped - start) / span).coerceIn(0f, 1f)
+
+    val animatedFraction by animateFloatAsState(
+        targetValue = rawFraction,
+        animationSpec = if (isDragging) HushSprings.follow() else HushSprings.fluid(),
+        label = "appleSliderFraction",
+    )
+    val thumbScale by animateFloatAsState(
+        targetValue = if (isDragging) 1.08f else 1f,
+        animationSpec = HushSprings.overshoot(),
+        label = "appleSliderThumbScale",
+    )
+
+    fun snapValue(xPx: Float): Float {
+        val usable = (widthPx - thumbPx).coerceAtLeast(1f)
+        val frac = ((xPx - thumbPx / 2f) / usable).coerceIn(0f, 1f)
+        val snappedFrac = if (steps > 0) {
+            val intervals = steps + 1
+            (frac * intervals).roundToInt().toFloat() / intervals.toFloat()
+        } else {
+            frac
+        }
+        return (start + snappedFrac * span).coerceIn(start, end)
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(36.dp)
+            .graphicsLayer { alpha = if (enabled) 1f else 0.42f }
+            .onSizeChanged { widthPx = it.width.toFloat().coerceAtLeast(1f) }
+            .pointerInput(enabled, start, end, steps) {
+                if (!enabled) return@pointerInput
+                awaitEachGesture {
+                    val down = awaitFirstDown()
+                    val slop = viewConfiguration.touchSlop
+                    var dragging = false
+                    var cancelled = false
+                    var lastEmitted = latestClamped
+
+                    fun emitAt(x: Float, allowHaptic: Boolean) {
+                        val next = snapValue(x)
+                        if (abs(next - lastEmitted) > 1e-5f) {
+                            if (allowHaptic) {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            }
+                            lastEmitted = next
+                            latestOnValueChange(next)
+                        }
+                    }
+
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull { it.id == down.id }
+                        if (change == null || change.isConsumed) {
+                            cancelled = true
+                            break
+                        }
+                        if (!change.pressed) {
+                            if (!dragging) {
+                                emitAt(change.position.x, allowHaptic = true)
+                            }
+                            break
+                        }
+                        val dx = change.position.x - down.position.x
+                        val dy = change.position.y - down.position.y
+                        if (!dragging) {
+                            if (abs(dx) > slop && abs(dx) >= abs(dy)) {
+                                dragging = true
+                                isDragging = true
+                                change.consume()
+                                emitAt(change.position.x, allowHaptic = true)
+                            } else if (abs(dy) > slop && abs(dy) > abs(dx)) {
+                                // Vertical scroll gesture: yield cleanly to parent LazyColumn
+                                cancelled = true
+                                break
+                            }
+                        } else {
+                            change.consume()
+                            emitAt(change.position.x, allowHaptic = true)
+                        }
+                    }
+
+                    if (isDragging) {
+                        isDragging = false
+                    }
+                    if (!cancelled) {
+                        latestOnFinished?.invoke()
+                    }
+                }
+            },
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxWidth(),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            val travelWidth = (maxWidth - thumbDiameter).coerceAtLeast(0.dp)
+            Canvas(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(4.dp),
+            ) {
+                val capRadius = thumbDiameter.toPx() / 2f
+                val centerY = size.height / 2f
+                val startX = capRadius
+                val endX = (size.width - capRadius).coerceAtLeast(startX)
+                val activeEndX = startX + (endX - startX) * animatedFraction
+                drawLine(
+                    color = inactiveTrackColor,
+                    start = Offset(startX, centerY),
+                    end = Offset(endX, centerY),
+                    strokeWidth = size.height,
+                    cap = StrokeCap.Round,
+                )
+                drawLine(
+                    color = activeTrackColor,
+                    start = Offset(startX, centerY),
+                    end = Offset(activeEndX, centerY),
+                    strokeWidth = size.height,
+                    cap = StrokeCap.Round,
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .offset(x = travelWidth * animatedFraction)
+                    .size(thumbDiameter)
+                    .graphicsLayer {
+                        scaleX = thumbScale
+                        scaleY = thumbScale
+                    }
+                    .shadow(
+                        elevation = if (isDragging) 6.dp else 4.dp,
+                        shape = CircleShape,
+                        ambientColor = Color.Black.copy(alpha = 0.16f),
+                        spotColor = Color.Black.copy(alpha = 0.28f),
+                    )
+                    .clip(CircleShape)
+                    .background(Color.White)
+                    .border(0.6.dp, Color.Black.copy(alpha = 0.08f), CircleShape),
+            )
+        }
+    }
+}
+
+/** Slim animated Apple capsule progress bar (ideal for RAM / ZRAM gauges). */
+@Composable
+fun AppleMeterBar(
+    fraction: Float,
+    color: Color,
+    modifier: Modifier = Modifier,
+    height: Dp = 5.dp,
+    trackColor: Color = HushTheme.colors.trackBg,
+) {
+    val animated by animateFloatAsState(
+        targetValue = fraction.coerceIn(0f, 1f),
+        animationSpec = HushSprings.fluid(),
+        label = "appleMeterBar",
+    )
+    BoxWithConstraints(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(height)
+            .clip(CircleShape)
+            .background(trackColor),
+    ) {
+        if (animated > 0.002f) {
+            Box(
+                modifier = Modifier
+                    .width((maxWidth * animated).coerceAtLeast(height))
+                    .fillMaxHeight()
+                    .clip(CircleShape)
+                    .background(color),
+            )
+        }
+    }
+}
+
 @Composable
 fun BreathingDot(
     color: Color,
@@ -414,7 +641,7 @@ fun AppIconAvatar(
     }
 }
 
-// --- Apple Liquid Glass Floating 3-Tab Pill Dock with Sliding Spring Indicator ---
+// --- Apple Liquid Glass Floating 3-Tab Pill Dock with Liquid-Stretching Indicator ---
 
 @Composable
 fun AppleFloatingTabBar(
@@ -426,15 +653,25 @@ fun AppleFloatingTabBar(
     val tabs = HushTab.entries
     val selectedIndex = tabs.indexOf(activeTab).coerceAtLeast(0)
 
-    val pillShape = RoundedCornerShape(100.dp)
-    Surface(
+    val pos by animateFloatAsState(
+        targetValue = selectedIndex.toFloat(),
+        animationSpec = HushSprings.fluid(),
+        label = "tabLiquidPos",
+    )
+
+    Box(
         modifier = modifier
-            .width(264.dp)
-            .height(58.dp),
-        shape = pillShape,
-        color = c.dockBackground,
-        border = BorderStroke(0.8.dp, c.dockBorder),
-        shadowElevation = if (c.isDark) 12.dp else 10.dp,
+            .width(268.dp)
+            .height(60.dp)
+            .shadow(
+                elevation = if (c.isDark) 20.dp else 18.dp,
+                shape = CircleShape,
+                ambientColor = Color.Black.copy(alpha = if (c.isDark) 0.45f else 0.10f),
+                spotColor = Color.Black.copy(alpha = if (c.isDark) 0.62f else 0.16f),
+            )
+            .clip(CircleShape)
+            .background(c.dockBackground)
+            .border(0.75.dp, c.dockBorder, CircleShape),
     ) {
         BoxWithConstraints(
             modifier = Modifier
@@ -442,20 +679,26 @@ fun AppleFloatingTabBar(
                 .padding(5.dp),
         ) {
             val slotWidth = maxWidth / tabs.size
-            val indicatorOffset by androidx.compose.animation.core.animateDpAsState(
-                targetValue = slotWidth * selectedIndex,
-                animationSpec = spring(dampingRatio = 0.72f, stiffness = 420f),
-                label = "tabIndicatorOffset",
-            )
+            // Liquid stretch peak mid-travel between tabs, relaxing back to exact slot width at rest
+            val travel = abs(pos - pos.roundToInt())
+            val stretch = 24.dp * (travel * 2f).coerceIn(0f, 1f)
+            val pillWidth = (slotWidth + stretch).coerceAtMost(maxWidth)
+            val pillLeft = (slotWidth * pos - stretch / 2f)
+                .coerceIn(0.dp, (maxWidth - pillWidth).coerceAtLeast(0.dp))
 
-            // Sliding spring selection pill
+            // Liquid-stretching translucent indicator pill
             Box(
                 modifier = Modifier
-                    .offset(x = indicatorOffset)
-                    .width(slotWidth)
+                    .offset(x = pillLeft)
+                    .width(pillWidth)
                     .fillMaxHeight()
-                    .clip(RoundedCornerShape(100.dp))
-                    .background(if (c.isDark) c.surfaceMuted else c.blueSoft),
+                    .clip(CircleShape)
+                    .background(c.blueSoft)
+                    .border(
+                        width = 0.5.dp,
+                        color = c.blue.copy(alpha = if (c.isDark) 0.22f else 0.10f),
+                        shape = CircleShape,
+                    ),
             )
 
             Row(modifier = Modifier.fillMaxSize()) {
@@ -476,8 +719,12 @@ fun AppleFloatingTabBar(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight()
-                            .clip(RoundedCornerShape(100.dp))
-                            .applePressScale(pressedScale = 0.94f, cornerRadius = 100.dp) {
+                            .clip(CircleShape)
+                            .applePressScale(
+                                pressedScale = 0.92f,
+                                cornerRadius = 100.dp,
+                                shadowAlpha = 0f,
+                            ) {
                                 onSelectTab(tab)
                             },
                         contentAlignment = Alignment.Center,

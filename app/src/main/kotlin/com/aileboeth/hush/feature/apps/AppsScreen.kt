@@ -12,10 +12,15 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
@@ -27,23 +32,35 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.aileboeth.hush.AppleConfirmDialog
 import com.aileboeth.hush.contract.AppGroup
+import com.aileboeth.hush.contract.DaemonStatus
 import com.aileboeth.hush.contract.ManagedAppInfo
 import com.aileboeth.hush.design.AppIconAvatar
 import com.aileboeth.hush.design.AppleGroupedCard
 import com.aileboeth.hush.design.HushIcons
 import com.aileboeth.hush.design.HushTheme
 import com.aileboeth.hush.design.HushType
+import com.aileboeth.hush.design.StaggerClock
 import com.aileboeth.hush.design.applePressScale
 import com.aileboeth.hush.design.formatMemoryKb
+import com.aileboeth.hush.design.rememberStaggerClock
 import com.aileboeth.hush.design.staggeredCascade
 import com.aileboeth.hush.design.tierAccentColor
 import com.aileboeth.hush.design.tierShortLabel
@@ -62,62 +79,118 @@ fun AppsScreen(
     onSortChange: (AppSortMode) -> Unit,
     onSearchChange: (String) -> Unit,
     onSelectApp: (String) -> Unit,
+    onRestoreAllRestrictions: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val c = HushTheme.colors
     val apps = uiState.filteredApps
+    val isRunning = uiState.daemonStatus is DaemonStatus.Running
+    val stagger = rememberStaggerClock(uiState.appFilter, uiState.appSort)
+    val refreshState = rememberPullToRefreshState()
+    val statusTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    var showRestoreDialog by remember { mutableStateOf(false) }
 
     PullToRefreshBox(
         isRefreshing = uiState.isRefreshing,
         onRefresh = onRefresh,
+        state = refreshState,
+        indicator = {
+            PullToRefreshDefaults.Indicator(
+                state = refreshState,
+                isRefreshing = uiState.isRefreshing,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding(),
+            )
+        },
         modifier = modifier.fillMaxSize(),
     ) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 112.dp),
+            contentPadding = PaddingValues(
+                start = 20.dp,
+                end = 20.dp,
+                top = statusTop + 10.dp,
+                bottom = 120.dp,
+            ),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             item(key = "apps_header") {
                 Column(
-                    modifier = Modifier.padding(top = 6.dp, bottom = 4.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
+                    verticalArrangement = Arrangement.spacedBy(11.dp),
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
+                        verticalAlignment = Alignment.Bottom,
                     ) {
-                        Text(text = "应用", style = HushType.largeTitle, color = c.textPrimary)
+                        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                            val countCaption = if (uiState.appFilter == AppFilterMode.ALL && uiState.appSearchQuery.isBlank()) {
+                                "${uiState.managedApps.size} 个应用"
+                            } else {
+                                "显示 ${apps.size} / ${uiState.managedApps.size} 个应用"
+                            }
+                            Text(
+                                text = countCaption,
+                                style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                                color = c.textSecondary,
+                            )
+                            Text(text = "应用", style = HushType.largeTitle, color = c.textPrimary)
+                        }
 
-                        // Minimal sort pill
-                        Surface(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(100.dp))
-                                .applePressScale(cornerRadius = 100.dp) {
-                                    val entries = AppSortMode.entries
-                                    val next = entries[(entries.indexOf(uiState.appSort) + 1) % entries.size]
-                                    onSortChange(next)
-                                },
-                            shape = RoundedCornerShape(100.dp),
-                            color = c.surface,
-                            border = BorderStroke(0.7.dp, c.glassBorder),
+                        Row(
+                            modifier = Modifier.padding(bottom = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                            ) {
-                                Icon(
-                                    imageVector = HushIcons.Sort,
-                                    contentDescription = null,
-                                    tint = c.blue,
-                                    modifier = Modifier.size(14.dp),
-                                )
+                            if (uiState.restrictedAppCount > 0 && isRunning) {
                                 Text(
-                                    text = uiState.appSort.label,
-                                    style = HushType.micro.copy(fontWeight = FontWeight.SemiBold),
-                                    color = c.textPrimary,
+                                    text = "全部还原",
+                                    style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                                    color = if (uiState.isGlobalActionBusy) c.textTertiary else c.blue,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(100.dp))
+                                        .applePressScale(
+                                            enabled = !uiState.isGlobalActionBusy,
+                                            cornerRadius = 100.dp,
+                                        ) {
+                                            showRestoreDialog = true
+                                        }
+                                        .padding(horizontal = 8.dp, vertical = 6.dp),
                                 )
+                            }
+
+                            // Minimal sort cycle pill
+                            Surface(
+                                modifier = Modifier
+                                    .applePressScale(cornerRadius = 100.dp) {
+                                        val entries = AppSortMode.entries
+                                        val next = entries[(entries.indexOf(uiState.appSort) + 1) % entries.size]
+                                        onSortChange(next)
+                                    },
+                                shape = RoundedCornerShape(100.dp),
+                                color = if (c.isDark) c.surfaceElevated else c.surface,
+                                border = BorderStroke(0.7.dp, c.glassBorder),
+                                shadowElevation = if (c.isDark) 0.dp else 1.5.dp,
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = HushIcons.Sort,
+                                        contentDescription = null,
+                                        tint = c.blue,
+                                        modifier = Modifier.size(14.dp),
+                                    )
+                                    Text(
+                                        text = uiState.appSort.label,
+                                        style = HushType.micro.copy(fontWeight = FontWeight.SemiBold),
+                                        color = c.textPrimary,
+                                    )
+                                }
                             }
                         }
                     }
@@ -126,9 +199,10 @@ fun AppsScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(14.dp))
+                            .height(40.dp)
+                            .clip(RoundedCornerShape(13.dp))
                             .background(if (c.isDark) c.surface else c.trackBg.copy(alpha = 0.65f))
-                            .padding(horizontal = 13.dp, vertical = 10.dp),
+                            .padding(horizontal = 12.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
@@ -152,23 +226,32 @@ fun AppsScreen(
                             )
                         }
                         if (uiState.appSearchQuery.isNotEmpty()) {
-                            Icon(
-                                imageVector = HushIcons.Close,
-                                contentDescription = "清除",
-                                tint = c.textTertiary,
+                            Box(
                                 modifier = Modifier
-                                    .size(16.dp)
-                                    .applePressScale(cornerRadius = 100.dp) { onSearchChange("") },
-                            )
+                                    .size(18.dp)
+                                    .clip(CircleShape)
+                                    .background(c.textTertiary.copy(alpha = 0.55f))
+                                    .applePressScale(cornerRadius = 100.dp, shadowAlpha = 0f) {
+                                        onSearchChange("")
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = HushIcons.Close,
+                                    contentDescription = "清除",
+                                    tint = c.surface,
+                                    modifier = Modifier.size(11.dp),
+                                )
+                            }
                         }
                     }
 
-                    // Clean horizontal filter pills
+                    // Compact horizontal filter strip with live counts
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(7.dp),
                     ) {
                         AppFilterMode.entries.forEach { mode ->
                             val selected = uiState.appFilter == mode
@@ -181,16 +264,20 @@ fun AppsScreen(
                             }
                             Surface(
                                 modifier = Modifier
-                                    .clip(RoundedCornerShape(100.dp))
                                     .applePressScale(cornerRadius = 100.dp) { onFilterChange(mode) },
                                 shape = RoundedCornerShape(100.dp),
                                 color = if (selected) c.blue else c.surface,
-                                border = if (!selected && c.isDark) BorderStroke(0.6.dp, c.glassBorder) else null,
+                                border = if (!selected) {
+                                    BorderStroke(0.6.dp, if (c.isDark) c.glassBorder else c.separator)
+                                } else {
+                                    null
+                                },
+                                shadowElevation = if (!selected && !c.isDark) 0.5.dp else 0.dp,
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(horizontal = 13.dp, vertical = 7.dp),
+                                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.5.dp),
                                     verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
                                 ) {
                                     Text(
                                         text = mode.label,
@@ -199,12 +286,21 @@ fun AppsScreen(
                                     )
                                     Text(
                                         text = count.toString(),
-                                        style = HushType.micro,
-                                        color = if (selected) c.onBlue.copy(alpha = 0.8f) else c.textTertiary,
+                                        style = HushType.micro.copy(fontFeatureSettings = "tnum"),
+                                        color = if (selected) c.onBlue.copy(alpha = 0.84f) else c.textTertiary,
                                     )
                                 }
                             }
                         }
+                    }
+
+                    if (!isRunning && uiState.managedApps.isNotEmpty()) {
+                        Text(
+                            text = "守护未运行 · 可先完成分档，激活后实时读取内存与后台操作",
+                            style = HushType.micro,
+                            color = c.textTertiary,
+                            modifier = Modifier.padding(horizontal = 4.dp),
+                        )
                     }
                 }
             }
@@ -230,6 +326,7 @@ fun AppsScreen(
                     AppSharedElementRowCard(
                         app = app,
                         index = index,
+                        stagger = stagger,
                         sharedTransitionScope = sharedTransitionScope,
                         animatedVisibilityScope = animatedVisibilityScope,
                         onClick = { onSelectApp(app.packageName) },
@@ -238,6 +335,20 @@ fun AppsScreen(
             }
         }
     }
+
+    if (showRestoreDialog) {
+        AppleConfirmDialog(
+            title = "还原全部后台限制？",
+            message = "将恢复 Hush 写入过的 ${uiState.restrictedAppCount} 个应用的 appops 与待机桶修改，不影响你的应用档位配置。",
+            confirmText = "确认还原",
+            destructive = false,
+            onDismiss = { showRestoreDialog = false },
+            onConfirm = {
+                showRestoreDialog = false
+                onRestoreAllRestrictions()
+            },
+        )
+    }
 }
 
 @OptIn(ExperimentalSharedTransitionApi::class)
@@ -245,6 +356,7 @@ fun AppsScreen(
 private fun AppSharedElementRowCard(
     app: ManagedAppInfo,
     index: Int,
+    stagger: StaggerClock,
     sharedTransitionScope: SharedTransitionScope,
     animatedVisibilityScope: AnimatedVisibilityScope,
     onClick: () -> Unit,
@@ -252,19 +364,19 @@ private fun AppSharedElementRowCard(
     val c = HushTheme.colors
     val shape = RoundedCornerShape(20.dp)
     val accent = tierAccentColor(app.group)
+    val statusBadge = primaryStatusBadge(app)
 
     with(sharedTransitionScope) {
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
-                .staggeredCascade(index)
+                .staggeredCascade(index, stagger)
                 .sharedBounds(
                     sharedContentState = rememberSharedContentState(key = "app_card_${app.packageName}"),
                     animatedVisibilityScope = animatedVisibilityScope,
                     boundsTransform = { _, _ -> spring(dampingRatio = 0.80f, stiffness = 360f) },
                     clipInOverlayDuringTransition = OverlayClip(shape),
                 )
-                .clip(shape)
                 .applePressScale(pressedScale = 0.975f, cornerRadius = 20.dp, onClick = onClick),
             shape = shape,
             color = c.surface,
@@ -274,9 +386,9 @@ private fun AppSharedElementRowCard(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 15.dp, vertical = 13.dp),
+                    .padding(horizontal = 15.dp, vertical = 12.5.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(13.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 AppIconAvatar(
                     packageName = app.packageName,
@@ -303,40 +415,67 @@ private fun AppSharedElementRowCard(
                             animatedVisibilityScope = animatedVisibilityScope,
                         ),
                     )
-                    val meta = buildString {
-                        if (app.totalPssKb > 0L) {
-                            append(formatMemoryKb(app.totalPssKb))
-                            if (app.swapPssKb > 0L) append(" · Swap ${formatMemoryKb(app.swapPssKb)}")
-                        } else {
-                            append(if (app.running) "后台运行中" else "未运行")
-                        }
-                        if (app.isFrozen) append(" · 冻结")
-                        if (app.isPlayingAudio) append(" · 音频免杀")
-                        if (app.isDualSpace) append(" · 双开")
-                        if (app.restriction.hasAnyRestriction) append(" · 已限后台")
+                    // Pure memory/runtime line (no extra status words crammed in, preventing truncation!)
+                    val memoryLine = when {
+                        app.totalPssKb > 0L && app.swapPssKb > 0L ->
+                            "${formatMemoryKb(app.totalPssKb)} · Swap ${formatMemoryKb(app.swapPssKb)}"
+                        app.totalPssKb > 0L -> formatMemoryKb(app.totalPssKb)
+                        app.running -> "后台运行中"
+                        else -> "未运行"
                     }
                     Text(
-                        text = meta,
-                        style = HushType.micro,
+                        text = memoryLine,
+                        style = HushType.micro.copy(fontFeatureSettings = "tnum"),
                         color = c.textSecondary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
 
-                // Ultra-clean dot + tier text + chevron
+                // Clean right-aligned tier + status badge stack + chevron (zero clipping)
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(7.dp),
                 ) {
-                    if (app.group != AppGroup.UNSET) {
-                        Box(Modifier.size(6.dp).clip(CircleShape).background(accent))
-                        Text(
-                            text = tierShortLabel(app.group),
-                            style = HushType.micro.copy(fontWeight = FontWeight.SemiBold),
-                            color = accent,
-                        )
+                    if (app.group != AppGroup.UNSET || statusBadge != null) {
+                        Column(
+                            horizontalAlignment = Alignment.End,
+                            verticalArrangement = Arrangement.spacedBy(3.dp),
+                        ) {
+                            if (app.group != AppGroup.UNSET) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    Box(Modifier.size(6.dp).clip(CircleShape).background(accent))
+                                    Text(
+                                        text = tierShortLabel(app.group),
+                                        style = HushType.micro.copy(fontWeight = FontWeight.SemiBold),
+                                        color = accent,
+                                        maxLines = 1,
+                                    )
+                                }
+                            }
+                            if (statusBadge != null) {
+                                val (tagText, fg, bg) = statusBadge
+                                Text(
+                                    text = tagText,
+                                    style = HushType.micro.copy(
+                                        fontSize = 10.5.sp,
+                                        lineHeight = 13.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                    ),
+                                    color = fg,
+                                    maxLines = 1,
+                                    modifier = Modifier
+                                        .clip(CircleShape)
+                                        .background(bg)
+                                        .padding(horizontal = 7.dp, vertical = 2.dp),
+                                )
+                            }
+                        }
                     }
+
                     Icon(
                         imageVector = HushIcons.ChevronRight,
                         contentDescription = null,
@@ -346,5 +485,18 @@ private fun AppSharedElementRowCard(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun primaryStatusBadge(app: ManagedAppInfo): Triple<String, Color, Color>? {
+    val c = HushTheme.colors
+    return when {
+        app.isPlayingAudio -> Triple("音频中", c.purple, c.purple.copy(alpha = if (c.isDark) 0.24f else 0.12f))
+        app.restriction.hasAnyRestriction -> Triple("已限后台", c.orange, c.orangeSoft)
+        app.isFrozen -> Triple("冻结", c.indigo, c.indigoSoft)
+        app.isDualSpace -> Triple("双开", c.blue, c.blueSoft)
+        app.running -> Triple("运行中", c.green, c.greenSoft)
+        else -> null
     }
 }

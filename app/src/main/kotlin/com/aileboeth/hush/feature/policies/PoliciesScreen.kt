@@ -1,35 +1,52 @@
 package com.aileboeth.hush.feature.policies
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.material3.AlertDialog
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.aileboeth.hush.AppleConfirmDialog
 import com.aileboeth.hush.BuildConfig
 import com.aileboeth.hush.contract.DaemonStatus
 import com.aileboeth.hush.contract.PolicyConfig
@@ -41,13 +58,14 @@ import com.aileboeth.hush.design.HushType
 import com.aileboeth.hush.design.OdometerText
 import com.aileboeth.hush.design.applePressScale
 import com.aileboeth.hush.design.formatMemoryMb
+import com.aileboeth.hush.design.rememberStaggerClock
 import com.aileboeth.hush.design.staggeredCascade
 import com.aileboeth.hush.state.HushUiState
 import kotlin.math.roundToInt
 
 /**
- * Pure Apple iOS Settings–inspired policy screen with grouped cards, iOS green switches,
- * rolling Odometer slider readouts, and restrained Apple footnotes.
+ * Pure Apple iOS Settings–inspired policy screen with grouped cards, sleek iOS toggles,
+ * classic pill-thumb sliders, rolling [OdometerText] readouts, and natural-language footnotes.
  */
 @Composable
 fun PoliciesScreen(
@@ -62,27 +80,43 @@ fun PoliciesScreen(
     val c = HushTheme.colors
     val policy = uiState.policyConfig
     val isRunning = uiState.daemonStatus is DaemonStatus.Running
+    val stagger = rememberStaggerClock()
+    val statusTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     var showRestoreDialog by remember { mutableStateOf(false) }
     var showStopDialog by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),
-        contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 12.dp, bottom = 112.dp),
-        verticalArrangement = Arrangement.spacedBy(22.dp),
+        contentPadding = PaddingValues(
+            start = 20.dp,
+            end = 20.dp,
+            top = statusTop + 10.dp,
+            bottom = 120.dp,
+        ),
+        verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
         item(key = "title") {
-            Text(
-                text = "策略",
-                style = HushType.largeTitle,
-                color = c.textPrimary,
-                modifier = Modifier.padding(top = 6.dp),
-            )
+            Column(
+                modifier = Modifier.padding(top = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(1.dp),
+            ) {
+                Text(
+                    text = "自动化",
+                    style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                    color = c.textSecondary,
+                )
+                Text(
+                    text = "策略",
+                    style = HushType.largeTitle,
+                    color = c.textPrimary,
+                )
+            }
         }
 
         // Section 1: Master Automation
         item(key = "master") {
             Column(
-                modifier = Modifier.staggeredCascade(0),
+                modifier = Modifier.staggeredCascade(0, stagger),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 AppleGroupedCard {
@@ -105,7 +139,7 @@ fun PoliciesScreen(
         // Section 2: Timing & Exemptions
         item(key = "timing") {
             Column(
-                modifier = Modifier.staggeredCascade(1),
+                modifier = Modifier.staggeredCascade(1, stagger),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 SectionCaption("时机与豁免")
@@ -163,7 +197,7 @@ fun PoliciesScreen(
         // Section 3: Memory Pressure Guardrails
         item(key = "pressure") {
             Column(
-                modifier = Modifier.staggeredCascade(2),
+                modifier = Modifier.staggeredCascade(2, stagger),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 SectionCaption("内存水位护航")
@@ -221,7 +255,7 @@ fun PoliciesScreen(
         // Section 4: Daemon & Safety Actions
         item(key = "daemon_ops") {
             Column(
-                modifier = Modifier.staggeredCascade(3),
+                modifier = Modifier.staggeredCascade(3, stagger),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 SectionCaption("守护与安全")
@@ -265,41 +299,29 @@ fun PoliciesScreen(
     }
 
     if (showRestoreDialog) {
-        AlertDialog(
-            onDismissRequest = { showRestoreDialog = false },
-            containerColor = c.surface,
-            title = { Text("还原全部后台限制？", style = HushType.sectionTitle, color = c.textPrimary) },
-            text = { Text("将恢复 Hush 写入过的所有 appops 与待机桶修改，不影响你的应用档位配置。", style = HushType.body, color = c.textSecondary) },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showRestoreDialog = false
-                        onRestoreAllRestrictions()
-                    },
-                ) { Text("确认还原", color = c.blue, fontWeight = FontWeight.SemiBold) }
-            },
-            dismissButton = {
-                TextButton(onClick = { showRestoreDialog = false }) { Text("取消", color = c.textSecondary) }
+        AppleConfirmDialog(
+            title = "还原全部后台限制？",
+            message = "将恢复 Hush 写入过的所有 appops 与待机桶修改，不影响你的应用档位配置。",
+            confirmText = "确认还原",
+            destructive = false,
+            onDismiss = { showRestoreDialog = false },
+            onConfirm = {
+                showRestoreDialog = false
+                onRestoreAllRestrictions()
             },
         )
     }
 
     if (showStopDialog) {
-        AlertDialog(
-            onDismissRequest = { showStopDialog = false },
-            containerColor = c.surface,
-            title = { Text("停止守护进程？", style = HushType.sectionTitle, color = c.textPrimary) },
-            text = { Text("停止后将暂停自动清理与内存采样，下次可通过无线调试一键恢复。", style = HushType.body, color = c.textSecondary) },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showStopDialog = false
-                        onStopDaemon()
-                    },
-                ) { Text("停止", color = c.red, fontWeight = FontWeight.SemiBold) }
-            },
-            dismissButton = {
-                TextButton(onClick = { showStopDialog = false }) { Text("取消", color = c.blue) }
+        AppleConfirmDialog(
+            title = "停止守护进程？",
+            message = "停止后将暂停自动清理与内存采样，下次可通过无线调试一键恢复。",
+            confirmText = "停止",
+            destructive = true,
+            onDismiss = { showStopDialog = false },
+            onConfirm = {
+                showStopDialog = false
+                onStopDaemon()
             },
         )
     }
@@ -345,16 +367,76 @@ private fun AppleSwitchRow(
             Text(text = title, style = HushType.cardTitle, color = c.textPrimary)
             Text(text = subtitle, style = HushType.micro, color = c.textSecondary)
         }
-        Switch(
+        PolicyIosSwitch(
             checked = checked,
             onCheckedChange = onCheckedChange,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = Color.White,
-                checkedTrackColor = c.green,
-                uncheckedThumbColor = Color.White,
-                uncheckedTrackColor = c.trackBg,
-                uncheckedBorderColor = Color.Transparent,
-            ),
+        )
+    }
+}
+
+@Composable
+private fun PolicyIosSwitch(
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true,
+) {
+    val c = HushTheme.colors
+    val haptic = LocalHapticFeedback.current
+    var pressed by remember { mutableStateOf(false) }
+    val onChangeLatest by rememberUpdatedState(onCheckedChange)
+
+    val trackColor by animateColorAsState(
+        targetValue = if (checked) c.green else c.trackBg,
+        animationSpec = tween(200),
+        label = "policySwitchTrack",
+    )
+    val thumbFraction by animateFloatAsState(
+        targetValue = if (checked) 1f else 0f,
+        animationSpec = spring(dampingRatio = 0.82f, stiffness = 460f),
+        label = "policySwitchPos",
+    )
+    val stretch by animateDpAsState(
+        targetValue = if (pressed && enabled) 6.dp else 0.dp,
+        animationSpec = spring(dampingRatio = 0.78f, stiffness = 520f),
+        label = "policySwitchStretch",
+    )
+
+    Box(
+        modifier = Modifier
+            .graphicsLayer { alpha = if (enabled) 1f else 0.42f }
+            .size(width = 51.dp, height = 31.dp)
+            .clip(CircleShape)
+            .background(trackColor)
+            .pointerInput(enabled, checked) {
+                if (!enabled) return@pointerInput
+                detectTapGestures(
+                    onPress = {
+                        pressed = true
+                        val released = tryAwaitRelease()
+                        pressed = false
+                        if (released) {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onChangeLatest(!checked)
+                        }
+                    },
+                )
+            },
+    ) {
+        val knobW = 27.dp + stretch
+        val travel = 51.dp - 4.dp - knobW
+        Box(
+            modifier = Modifier
+                .padding(2.dp)
+                .offset(x = travel * thumbFraction)
+                .size(width = knobW, height = 27.dp)
+                .shadow(
+                    elevation = 3.dp,
+                    shape = CircleShape,
+                    ambientColor = Color.Black.copy(alpha = 0.18f),
+                    spotColor = Color.Black.copy(alpha = 0.24f),
+                )
+                .clip(CircleShape)
+                .background(Color.White),
         )
     }
 }

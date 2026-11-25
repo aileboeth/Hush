@@ -52,7 +52,8 @@ data class MemorySamplePoint(
 data class HushUiState(
     val activeTab: HushTab = HushTab.OVERVIEW,
     val themePreference: ThemePreference = ThemePreference.SYSTEM,
-    val showActivationPanel: Boolean = false,
+    val showStatusPopover: Boolean = false,
+    val showActivationSheet: Boolean = false,
     val showActivitySheet: Boolean = false,
     val isPreviewMode: Boolean = false,
     val isRefreshing: Boolean = false,
