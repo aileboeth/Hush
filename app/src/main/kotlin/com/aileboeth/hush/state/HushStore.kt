@@ -623,7 +623,7 @@ class HushStore(
     fun launchDaemon(host: String? = null, port: Int? = null) {
         scope.launch {
             bootstrap.launchDaemon(host, port).fold(
-                onSuccess = { notify("已激活，现在可以关闭无线调试") },
+                onSuccess = { notify("守护进程已激活并上线") },
                 onFailure = { err -> notify(err.message ?: "启动失败", isError = true) },
             )
         }

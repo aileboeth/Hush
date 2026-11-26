@@ -51,7 +51,7 @@ class WirelessBootstrapController(
 
     override val usbFallbackCommand: String
         get() = "adb shell 'APK=\$(pm path ${SafetyGuardrails.SELF_PACKAGE} | head -n1 | cut -d: -f2); " +
-            "CLASSPATH=\"\$APK\" setsid /system/bin/app_process64 /system/bin --nice-name=hush_daemon " +
+            "trap \"\" HUP; CLASSPATH=\"\$APK\" nohup setsid -d /system/bin/app_process64 /system/bin --nice-name=hush_daemon " +
             "${HushProtocol.DAEMON_MAIN_CLASS} --port=$manualPort --version=$versionCode --token=$manualToken " +
             "</dev/null >/dev/null 2>&1 &'"
 
@@ -79,11 +79,22 @@ class WirelessBootstrapController(
 
     override fun startDiscovery() {
         mdns.start()
+        val initial = _state.value
+        if (initial !is BootstrapState.Pairing && initial !is BootstrapState.Launching) {
+            _state.value = BootstrapState.Discovering(
+                pairingEndpoint = mdns.endpoints.value.pairing,
+                connectEndpoint = mdns.endpoints.value.connect,
+            )
+        }
         discoveryJob?.cancel()
         discoveryJob = scope.launch {
             mdns.endpoints.collect { result ->
                 val cur = _state.value
-                if (cur is BootstrapState.Idle || cur is BootstrapState.Discovering || cur is BootstrapState.Error) {
+                if (cur is BootstrapState.Idle ||
+                    cur is BootstrapState.Discovering ||
+                    cur is BootstrapState.Error ||
+                    cur is BootstrapState.Ready
+                ) {
                     _state.value = BootstrapState.Discovering(
                         pairingEndpoint = result.pairing,
                         connectEndpoint = result.connect,

@@ -334,7 +334,7 @@ fun OverviewScreen(
                         )
                     } else if (!isOnline) {
                         Text(
-                            text = "本机一次性无线激活后即可接管后台与内存，零 Root、启动后可关闭无线调试",
+                            text = "本机无线调试或电脑 USB 激活后即可接管后台与内存，零 Root（保持开发者选项开启以防断连）",
                             style = HushType.caption,
                             color = c.textSecondary,
                             modifier = Modifier.padding(top = 6.dp),

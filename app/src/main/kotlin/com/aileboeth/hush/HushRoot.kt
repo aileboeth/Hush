@@ -14,6 +14,7 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -49,7 +50,10 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.text.style.TextOverflow
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -520,7 +524,7 @@ fun HushRoot(
             )
         }
 
-        // Dynamic-Island-inspired Floating Toast Pill at top
+        // Dynamic-Island-inspired Floating Toast Pill at top (swipe up or tap to dismiss immediately)
         SnackbarHost(
             hostState = snackbarHostState,
             modifier = Modifier
@@ -529,8 +533,42 @@ fun HushRoot(
                 .padding(top = 10.dp, start = 24.dp, end = 24.dp),
         ) { data ->
             val accent = if (lastNoticeIsError) c.red else c.green
+            val toastScope = rememberCoroutineScope()
+            val dragY = remember(data) { Animatable(0f) }
+            val dismissThresholdPx = with(LocalDensity.current) { 18.dp.toPx() }
             Surface(
-                shape = RoundedCornerShape(100.dp),
+                modifier = Modifier
+                    .graphicsLayer {
+                        val y = dragY.value.coerceAtMost(12f)
+                        translationY = y
+                        alpha = (1f - (-y / (dismissThresholdPx * 2.5f)).coerceIn(0f, 0.85f))
+                    }
+                    .pointerInput(data) {
+                        detectTapGestures(onTap = { data.dismiss() })
+                    }
+                    .pointerInput(data) {
+                        detectVerticalDragGestures(
+                            onVerticalDrag = { change, dragAmount ->
+                                change.consume()
+                                val next = (dragY.value + dragAmount).coerceAtMost(10f)
+                                toastScope.launch { dragY.snapTo(next) }
+                            },
+                            onDragEnd = {
+                                if (dragY.value <= -dismissThresholdPx) {
+                                    toastScope.launch {
+                                        dragY.animateTo(-dismissThresholdPx * 3f, tween(120))
+                                        data.dismiss()
+                                    }
+                                } else {
+                                    toastScope.launch { dragY.animateTo(0f, HushSprings.fluid()) }
+                                }
+                            },
+                            onDragCancel = {
+                                toastScope.launch { dragY.animateTo(0f, HushSprings.fluid()) }
+                            },
+                        )
+                    },
+                shape = RoundedCornerShape(24.dp),
                 color = if (c.isDark) c.surfaceElevated else c.textPrimary,
                 border = if (c.isDark) BorderStroke(0.7.dp, c.glassBorder) else null,
                 shadowElevation = 10.dp,
@@ -550,6 +588,8 @@ fun HushRoot(
                         text = data.visuals.message,
                         style = HushType.caption,
                         color = if (c.isDark) c.textPrimary else c.surface,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
             }

@@ -1,7 +1,11 @@
 package com.aileboeth.hush.feature.activation
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -35,6 +39,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -212,7 +217,7 @@ fun StatusCapsulePopover(
                     text = if (status is DaemonStatus.Error && status.message.isNotBlank()) {
                         status.message
                     } else {
-                        "首次使用或重启手机后需无线激活一次，启动后即可关闭无线调试。"
+                        "守护进程已停止，请通过无线调试或电脑 USB 重新激活。"
                     },
                     style = HushType.body,
                     color = c.textSecondary,
@@ -345,6 +350,43 @@ fun ActivationSheetContent(
     val connectEndpoint = (bootState as? BootstrapState.Discovering)?.connectEndpoint ?: lastConnectEndpoint
 
     var wifiReady by remember { mutableStateOf(isWifiConnected(context)) }
+    var prevWifiReady by remember { mutableStateOf(wifiReady) }
+
+    // Live-observe Wi-Fi state so toggling Wi-Fi from Control Center updates immediately
+    DisposableEffect(context) {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                wifiReady = isWifiConnected(context)
+            }
+
+            override fun onLost(network: Network) {
+                wifiReady = isWifiConnected(context)
+            }
+
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                wifiReady = isWifiConnected(context)
+            }
+        }
+        val registered = runCatching {
+            cm?.registerDefaultNetworkCallback(callback)
+            cm != null
+        }.getOrDefault(false)
+        wifiReady = isWifiConnected(context)
+        onDispose {
+            if (registered) {
+                runCatching { cm?.unregisterNetworkCallback(callback) }
+            }
+        }
+    }
+
+    LaunchedEffect(wifiReady) {
+        if (wifiReady && !prevWifiReady) {
+            onRestartDiscovery()
+        }
+        prevWifiReady = wifiReady
+    }
+
     var hasNotificationPermission by remember {
         mutableStateOf(
             Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
@@ -389,8 +431,16 @@ fun ActivationSheetContent(
         if (uiState.hasPairedBefore) showRepairFlow = false
     }
 
+    // Strictly trust live `daemonStatus` so a stale `BootstrapState.Ready` can NEVER trap the user after disconnect!
     val runningNow = uiState.daemonStatus as? DaemonStatus.Running
-    val isReadyOnline = runningNow != null || bootState is BootstrapState.Ready
+    val isReadyOnline = runningNow != null
+
+    LaunchedEffect(isReadyOnline) {
+        if (!isReadyOnline) {
+            lastPairingEndpoint = null
+            lastConnectEndpoint = null
+        }
+    }
 
     Column(modifier = modifier.fillMaxSize()) {
         // Clean Apple Modal Sheet Header
@@ -402,8 +452,8 @@ fun ActivationSheetContent(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("无线激活", style = HushType.sectionTitle.copy(fontSize = 21.sp), color = c.textPrimary)
-                Text("本机一次性授权 · 启动后即可关闭无线调试", style = HushType.micro, color = c.textSecondary)
+                Text("激活守护", style = HushType.sectionTitle.copy(fontSize = 21.sp), color = c.textPrimary)
+                Text("本机无线调试或电脑 USB 激活 · 零 Root", style = HushType.micro, color = c.textSecondary)
             }
             Spacer(Modifier.width(12.dp))
             Surface(
@@ -432,7 +482,7 @@ fun ActivationSheetContent(
         ) {
             // Ready / Online Celebration Card
             if (isReadyOnline) {
-                val port = (bootState as? BootstrapState.Ready)?.port ?: runningNow?.port ?: 0
+                val port = runningNow?.port ?: 0
                 item(key = "ready_hero") {
                     AppleGroupedCard(contentPadding = PaddingValues(20.dp)) {
                         Row(
@@ -450,13 +500,19 @@ fun ActivationSheetContent(
                             }
                             Column {
                                 Text("守护进程运行中", style = HushType.sectionTitle, color = c.textPrimary)
-                                Text("127.0.0.1:$port · 现在可以安全关闭无线调试", style = HushType.micro, color = c.textSecondary)
+                                Text("127.0.0.1:$port · 请保持开发者选项开启", style = HushType.micro, color = c.textSecondary)
                             }
                         }
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            text = "保活提示：切勿关闭「开发者选项」总开关；部分新系统（如 OriginOS 6 / Android 16）断开 Wi-Fi 时会停止无线调试拉起的进程，若长期用流量推荐使用下方「电脑 USB 命令行」启动一次。",
+                            style = HushType.micro,
+                            color = c.textTertiary,
+                        )
                         Spacer(Modifier.height(14.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             ApplePillButton(
-                                text = "去关无线调试",
+                                text = "开发者选项",
                                 onClick = { openDeveloperOptions(context) },
                                 containerColor = c.surfaceMuted,
                                 contentColor = c.textPrimary,

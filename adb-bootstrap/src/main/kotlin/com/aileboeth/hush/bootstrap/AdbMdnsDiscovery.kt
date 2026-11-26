@@ -78,6 +78,7 @@ class AdbMdnsDiscovery(context: Context) {
             pendingResolves.clear()
             resolvingLegacy = false
         }
+        _endpoints.value = DiscoveryResult()
     }
 
     private fun createDiscoveryListener(

@@ -93,6 +93,14 @@ class RealGuardController(
 
     override suspend fun refreshSnapshot(): Result<Unit> {
         val user0Installed = loadInstalledUserApps()
+        // Self-heal session from persisted credentials if memory session dropped transiently
+        if (client.currentSession == null) {
+            store.loadSession()?.let { saved ->
+                if (client.connect(saved.port, saved.token).isSuccess) {
+                    syncConfigToDaemon()
+                }
+            }
+        }
         val statusRes = client.call(HushProtocol.METHOD_STATUS)
         if (statusRes.isFailure) {
             _daemonStatus.value = DaemonStatus.Disconnected
