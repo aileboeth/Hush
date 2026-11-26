@@ -1,9 +1,11 @@
 package com.aileboeth.hush.daemon
 
+import com.aileboeth.hush.contract.AppTarget
 import com.aileboeth.hush.contract.HushLog
 import com.aileboeth.hush.contract.HushProtocol
 import com.aileboeth.hush.contract.MiniJson
 import com.aileboeth.hush.contract.intVal
+import com.aileboeth.hush.contract.listOfObj
 import com.aileboeth.hush.contract.obj
 import com.aileboeth.hush.contract.str
 import java.io.BufferedReader
@@ -156,14 +158,29 @@ class DaemonRpcServer(
                 )
 
                 HushProtocol.METHOD_SAMPLE_APPS -> {
-                    val pkgs = (params["packages"] as? List<*>)?.mapNotNull { it as? String }
-                        ?: bridge.listUserPackages().toList()
-                    val samples = engine.samplePackages(pkgs)
+                    val explicitTargets = params.listOfObj("targets")
+                        .map(HushProtocol::decodeAppTarget)
+                        .filter { it.packageName.isNotBlank() }
+                    val targets = if (explicitTargets.isNotEmpty()) {
+                        explicitTargets
+                    } else {
+                        val pkgs = (params["packages"] as? List<*>)?.mapNotNull { it as? String }
+                            ?: bridge.listUserPackages().toList()
+                        pkgs.map { AppTarget(it, 0) }
+                    }
+                    val samples = engine.sampleTargets(targets)
                     mapOf(
                         "ok" to true,
                         "data" to mapOf("samples" to samples.map(HushProtocol::encodeAppSample)),
                     )
                 }
+
+                HushProtocol.METHOD_GET_CLONE_PACKAGES -> mapOf(
+                    "ok" to true,
+                    "data" to mapOf(
+                        "packages" to engine.listClonePackages().map(HushProtocol::encodeAppTarget),
+                    ),
+                )
 
                 HushProtocol.METHOD_SYNC_CONFIG -> {
                     val snapshot = HushProtocol.decodeConfigSnapshot(params)
@@ -173,26 +190,69 @@ class DaemonRpcServer(
 
                 HushProtocol.METHOD_FORCE_STOP -> {
                     val pkg = params.str("packageName")
-                    val res = engine.manualForceStop(pkg)
+                    val userId = params.intVal("userId", 0)
+                    val res = engine.manualForceStop(pkg, userId)
                     res.fold(
                         onSuccess = { freed -> mapOf("ok" to true, "data" to mapOf("freedKb" to freed)) },
                         onFailure = { err -> mapOf("ok" to false, "error" to (err.message ?: "强杀失败")) },
                     )
                 }
 
+                HushProtocol.METHOD_FORCE_STOP_BATCH -> {
+                    val targets = params.listOfObj("targets")
+                        .map(HushProtocol::decodeAppTarget)
+                        .filter { it.packageName.isNotBlank() }
+                    val res = engine.manualForceStopBatch(targets)
+                    res.fold(
+                        onSuccess = { r ->
+                            mapOf(
+                                "ok" to true,
+                                "data" to mapOf(
+                                    "affectedCount" to r.affectedCount,
+                                    "skippedCount" to r.skippedCount,
+                                    "freedKb" to r.freedKb,
+                                ),
+                            )
+                        },
+                        onFailure = { err -> mapOf("ok" to false, "error" to (err.message ?: "批量强杀失败")) },
+                    )
+                }
+
                 HushProtocol.METHOD_SOFT_TRIM -> {
                     val pkg = params.str("packageName")
-                    val res = engine.manualSoftTrim(pkg)
+                    val userId = params.intVal("userId", 0)
+                    val res = engine.manualSoftTrim(pkg, userId)
                     res.fold(
                         onSuccess = { freed -> mapOf("ok" to true, "data" to mapOf("freedKb" to freed)) },
                         onFailure = { err -> mapOf("ok" to false, "error" to (err.message ?: "温和瘦身失败")) },
                     )
                 }
 
+                HushProtocol.METHOD_SOFT_TRIM_BATCH -> {
+                    val targets = params.listOfObj("targets")
+                        .map(HushProtocol::decodeAppTarget)
+                        .filter { it.packageName.isNotBlank() }
+                    val res = engine.manualSoftTrimBatch(targets)
+                    res.fold(
+                        onSuccess = { r ->
+                            mapOf(
+                                "ok" to true,
+                                "data" to mapOf(
+                                    "affectedCount" to r.affectedCount,
+                                    "skippedCount" to r.skippedCount,
+                                    "freedKb" to r.freedKb,
+                                ),
+                            )
+                        },
+                        onFailure = { err -> mapOf("ok" to false, "error" to (err.message ?: "批量瘦身失败")) },
+                    )
+                }
+
                 HushProtocol.METHOD_SET_RESTRICTION -> {
                     val pkg = params.str("packageName")
+                    val userId = params.intVal("userId", 0)
                     val r = HushProtocol.decodeRestriction(params.obj("restriction").orEmpty())
-                    val res = engine.setRestriction(pkg, r)
+                    val res = engine.setRestriction(pkg, r, userId)
                     res.fold(
                         onSuccess = { mapOf("ok" to true) },
                         onFailure = { err -> mapOf("ok" to false, "error" to (err.message ?: "修改后台限制失败")) },

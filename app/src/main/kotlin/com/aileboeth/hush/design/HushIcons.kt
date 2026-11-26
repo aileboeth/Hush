@@ -529,4 +529,13 @@ object HushIcons {
             }
         }
     }
+
+    val Plus: ImageVector by lazy {
+        strokeIcon("Plus", strokeWidth = 2.1f) {
+            strokePath(strokeWidth = 2.1f) {
+                moveTo(12f, 5f); lineTo(12f, 19f)
+                moveTo(5f, 12f); lineTo(19f, 12f)
+            }
+        }
+    }
 }

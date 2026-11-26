@@ -22,6 +22,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
@@ -47,6 +49,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.aileboeth.hush.contract.AppGroup
+import com.aileboeth.hush.contract.AppTarget
 import com.aileboeth.hush.contract.DaemonStatus
 import com.aileboeth.hush.contract.ManagedAppInfo
 import com.aileboeth.hush.contract.SecondaryUserInfo
@@ -67,9 +70,10 @@ import com.aileboeth.hush.design.applePressScale
 import com.aileboeth.hush.design.formatClockShort
 import com.aileboeth.hush.design.formatMemoryKb
 import com.aileboeth.hush.design.formatMemoryMbFloat
+import com.aileboeth.hush.design.StaggerClock
 import com.aileboeth.hush.design.morphAnchor
-import com.aileboeth.hush.design.rememberStaggerClock
 import com.aileboeth.hush.design.staggeredCascade
+import com.aileboeth.hush.design.tierAccentColor
 import com.aileboeth.hush.state.AppFilterMode
 import com.aileboeth.hush.state.HushUiState
 import java.util.Calendar
@@ -143,17 +147,21 @@ fun OverviewScreen(
     onReconnect: () -> Unit,
     onOpenActivitySheet: () -> Unit,
     onNavigateAppsFilter: (AppFilterMode) -> Unit,
+    onNavigateCustomGroup: (String) -> Unit,
+    onOpenCreateGroup: () -> Unit,
+    onExecuteGroupAction: (String, AppGroup, List<AppTarget>) -> Unit,
     onOpenAppDetail: (String) -> Unit,
-    onQuickForceStop: (String, String) -> Unit,
-    onQuickSoftTrim: (String, String) -> Unit,
+    onQuickForceStop: (String, String, Int) -> Unit,
+    onQuickSoftTrim: (String, String, Int) -> Unit,
     onStopSecondaryUser: (SecondaryUserInfo) -> Unit,
+    listState: LazyListState = rememberLazyListState(),
     modifier: Modifier = Modifier,
 ) {
     val c = HushTheme.colors
     val runningStatus = uiState.daemonStatus as? DaemonStatus.Running
     val isOnline = runningStatus != null
     val mem = uiState.memoryOverview
-    val stagger = rememberStaggerClock()
+    val stagger = remember { StaggerClock(windowMs = if (listState.firstVisibleItemIndex == 0) 900L else 0L) }
     val refreshState = rememberPullToRefreshState()
     val statusTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
 
@@ -162,6 +170,7 @@ fun OverviewScreen(
     val samples = uiState.memoryHistory
     val activeSample = scrubbedIndex?.let { samples.getOrNull(it) } ?: samples.lastOrNull()
     val todayLine = remember { todayChineseDateLine() }
+    val fullSecondaryUsers = uiState.fullSecondaryUsers
 
     PullToRefreshBox(
         isRefreshing = uiState.isRefreshing,
@@ -179,6 +188,7 @@ fun OverviewScreen(
         modifier = modifier.fillMaxSize(),
     ) {
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(
                 start = 20.dp,
@@ -482,12 +492,97 @@ fun OverviewScreen(
                 }
             }
 
-            // 3.5 Multi-User Secondary Space Card (only shown when device has secondary Android users)
-            if (uiState.secondaryUsers.isNotEmpty()) {
-                item(key = "secondary_users") {
-                    val runningCount = uiState.secondaryUsers.count { it.running }
+            // 3.2 Quick App Groups Card (one-tap batch force-stop / soft-trim for custom & built-in groups)
+            val forceStopTierApps = uiState.appsInTier(AppGroup.FORCE_STOP)
+            val softTrimTierApps = uiState.appsInTier(AppGroup.SOFT_TRIM)
+            val showQuickGroups = uiState.customGroups.isNotEmpty() || forceStopTierApps.isNotEmpty() || softTrimTierApps.isNotEmpty()
+            if (showQuickGroups) {
+                item(key = "quick_groups") {
                     Column(
                         modifier = Modifier.staggeredCascade(2, stagger),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text("快捷分组", style = HushType.sectionTitle, color = c.textPrimary)
+                            Text(
+                                text = "+ 新建组",
+                                style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                                color = c.blue,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .applePressScale(cornerRadius = 8.dp, onClick = onOpenCreateGroup)
+                                    .padding(horizontal = 6.dp, vertical = 3.dp),
+                            )
+                        }
+
+                        AppleGroupedCard {
+                            val quickRows = buildList {
+                                uiState.customGroups.forEach { cg ->
+                                    add(
+                                        QuickGroupEntry(
+                                            title = cg.name,
+                                            action = cg.action,
+                                            members = uiState.appsInCustomGroup(cg),
+                                            onOpen = { onNavigateCustomGroup(cg.id) },
+                                        ),
+                                    )
+                                }
+                                if (uiState.customGroups.isEmpty()) {
+                                    if (forceStopTierApps.isNotEmpty()) {
+                                        add(
+                                            QuickGroupEntry(
+                                                title = "强杀组",
+                                                action = AppGroup.FORCE_STOP,
+                                                members = forceStopTierApps,
+                                                onOpen = { onNavigateAppsFilter(AppFilterMode.FORCE_STOP) },
+                                            ),
+                                        )
+                                    }
+                                    if (softTrimTierApps.isNotEmpty()) {
+                                        add(
+                                            QuickGroupEntry(
+                                                title = "保消息瘦身组",
+                                                action = AppGroup.SOFT_TRIM,
+                                                members = softTrimTierApps,
+                                                onOpen = { onNavigateAppsFilter(AppFilterMode.SOFT_TRIM) },
+                                            ),
+                                        )
+                                    }
+                                }
+                            }
+                            quickRows.forEachIndexed { idx, entry ->
+                                QuickGroupRow(
+                                    entry = entry,
+                                    isOnline = isOnline,
+                                    isBusy = uiState.isGlobalActionBusy,
+                                    onExecute = {
+                                        val targets = entry.members
+                                            .filter { !it.isSystemProtected }
+                                            .map { AppTarget(it.packageName, it.userId) }
+                                        onExecuteGroupAction(entry.title, entry.action, targets)
+                                    },
+                                )
+                                if (idx < quickRows.lastIndex) {
+                                    AppleInsetDivider(startIndent = 44.dp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3.5 Multi-User Secondary Space Card (strictly real full secondary systems — NEVER Xspace/clone!)
+            if (fullSecondaryUsers.isNotEmpty()) {
+                item(key = "secondary_users") {
+                    val runningCount = fullSecondaryUsers.count { it.running }
+                    Column(
+                        modifier = Modifier.staggeredCascade(3, stagger),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Row(
@@ -506,14 +601,14 @@ fun OverviewScreen(
                         }
 
                         AppleGroupedCard {
-                            uiState.secondaryUsers.forEachIndexed { idx, user ->
+                            fullSecondaryUsers.forEachIndexed { idx, user ->
                                 SecondaryUserRow(
                                     user = user,
                                     isOnline = isOnline,
                                     isBusy = user.userId in uiState.busyUserIds,
                                     onStopUser = { onStopSecondaryUser(user) },
                                 )
-                                if (idx < uiState.secondaryUsers.lastIndex) {
+                                if (idx < fullSecondaryUsers.lastIndex) {
                                     AppleInsetDivider(startIndent = 68.dp)
                                 }
                             }
@@ -531,7 +626,7 @@ fun OverviewScreen(
             if (focusApps.isNotEmpty()) {
                 item(key = "focus_apps") {
                     Column(
-                        modifier = Modifier.staggeredCascade(if (uiState.secondaryUsers.isNotEmpty()) 3 else 2, stagger),
+                        modifier = Modifier.staggeredCascade(if (fullSecondaryUsers.isNotEmpty()) 4 else 3, stagger),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Row(
@@ -560,12 +655,12 @@ fun OverviewScreen(
                                 FocusAppRow(
                                     app = app,
                                     isOnline = isOnline,
-                                    isBusy = app.packageName in uiState.busyPackages,
+                                    isBusy = app.appKey in uiState.busyPackages,
                                     sharedTransitionScope = sharedTransitionScope,
                                     animatedVisibilityScope = animatedVisibilityScope,
-                                    onOpenDetail = { onOpenAppDetail(app.packageName) },
-                                    onQuickForceStop = { onQuickForceStop(app.packageName, app.label) },
-                                    onQuickSoftTrim = { onQuickSoftTrim(app.packageName, app.label) },
+                                    onOpenDetail = { onOpenAppDetail(app.appKey) },
+                                    onQuickForceStop = { onQuickForceStop(app.packageName, app.displayLabel, app.userId) },
+                                    onQuickSoftTrim = { onQuickSoftTrim(app.packageName, app.displayLabel, app.userId) },
                                 )
                                 if (idx < focusApps.lastIndex) {
                                     AppleInsetDivider(startIndent = 68.dp)
@@ -734,7 +829,7 @@ private fun FocusAppRow(
             modifier = Modifier
                 .fillMaxWidth()
                 .sharedBounds(
-                    sharedContentState = rememberSharedContentState(key = "app_card_overview_${app.packageName}"),
+                    sharedContentState = rememberSharedContentState(key = "app_card_overview_${app.appKey}"),
                     animatedVisibilityScope = animatedVisibilityScope,
                     boundsTransform = { _, _ -> spring(dampingRatio = 0.80f, stiffness = 360f) },
                 )
@@ -748,7 +843,7 @@ private fun FocusAppRow(
                 label = app.label,
                 size = 40.dp,
                 modifier = Modifier.sharedElement(
-                    state = rememberSharedContentState(key = "app_icon_overview_${app.packageName}"),
+                    state = rememberSharedContentState(key = "app_icon_overview_${app.appKey}"),
                     animatedVisibilityScope = animatedVisibilityScope,
                 ),
             )
@@ -757,13 +852,30 @@ private fun FocusAppRow(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
-                Text(
-                    text = app.label,
-                    style = HushType.cardTitle,
-                    color = c.textPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text(
+                        text = app.label,
+                        style = HushType.cardTitle,
+                        color = c.textPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    if (app.isDualSpace) {
+                        Text(
+                            text = "双开",
+                            style = HushType.micro.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
+                            color = c.blue,
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(c.blueSoft)
+                                .padding(horizontal = 6.dp, vertical = 1.dp),
+                        )
+                    }
+                }
                 val subtitle = buildString {
                     append(formatMemoryKb(app.totalPssKb))
                     if (app.swapPssKb > 0L) append(" · Swap ${formatMemoryKb(app.swapPssKb)}")
@@ -956,6 +1068,92 @@ private fun SecondaryUserRow(
                         .clip(RoundedCornerShape(100.dp))
                         .background(c.neutralSoft)
                         .padding(horizontal = 10.dp, vertical = 6.dp),
+                )
+            }
+        }
+    }
+}
+
+private data class QuickGroupEntry(
+    val title: String,
+    val action: AppGroup,
+    val members: List<ManagedAppInfo>,
+    val onOpen: () -> Unit,
+)
+
+@Composable
+private fun QuickGroupRow(
+    entry: QuickGroupEntry,
+    isOnline: Boolean,
+    isBusy: Boolean,
+    onExecute: () -> Unit,
+) {
+    val c = HushTheme.colors
+    val accent = tierAccentColor(entry.action)
+    val running = entry.members.filter { it.running && !it.isSystemProtected }
+    val pssKb = running.sumOf { it.totalPssKb }
+    val subtitle = when {
+        entry.members.isEmpty() -> "暂无成员 · 点击添加"
+        running.isEmpty() -> "共 ${entry.members.size} 个 · 均未运行"
+        pssKb > 0L -> "${running.size} / ${entry.members.size} 运行中 · ${formatMemoryKb(pssKb)}"
+        else -> "${running.size} / ${entry.members.size} 运行中"
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .applePressScale(pressedScale = 0.985f, cornerRadius = 16.dp, onClick = entry.onOpen)
+            .padding(horizontal = 16.dp, vertical = 13.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(10.dp)
+                .clip(CircleShape)
+                .background(accent),
+        )
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                text = entry.title,
+                style = HushType.cardTitle,
+                color = c.textPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = subtitle,
+                style = HushType.micro,
+                color = c.textSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        when {
+            isOnline && running.isNotEmpty() && entry.action == AppGroup.FORCE_STOP -> {
+                FocusActionPill(
+                    label = "强杀 (${running.size})",
+                    bgColor = c.redSoft,
+                    fgColor = c.red,
+                    isBusy = isBusy,
+                    onClick = onExecute,
+                )
+            }
+            isOnline && running.isNotEmpty() && entry.action == AppGroup.SOFT_TRIM -> {
+                FocusActionPill(
+                    label = "瘦身 (${running.size})",
+                    bgColor = c.blueSoft,
+                    fgColor = c.blue,
+                    isBusy = isBusy,
+                    onClick = onExecute,
+                )
+            }
+            else -> {
+                Icon(
+                    imageVector = HushIcons.ChevronRight,
+                    contentDescription = null,
+                    tint = c.textTertiary,
+                    modifier = Modifier.size(16.dp),
                 )
             }
         }

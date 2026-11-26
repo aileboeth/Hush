@@ -2,12 +2,16 @@ package com.aileboeth.hush.engine
 
 import com.aileboeth.hush.contract.AdbEndpoint
 import com.aileboeth.hush.contract.AppGroup
+import com.aileboeth.hush.contract.AppKey
 import com.aileboeth.hush.contract.AppRestriction
+import com.aileboeth.hush.contract.AppTarget
+import com.aileboeth.hush.contract.BatchActionResult
 import com.aileboeth.hush.contract.BootstrapController
 import com.aileboeth.hush.contract.BootstrapState
 import com.aileboeth.hush.contract.CleanupAction
 import com.aileboeth.hush.contract.CleanupEvent
 import com.aileboeth.hush.contract.CleanupTrigger
+import com.aileboeth.hush.contract.CustomAppGroup
 import com.aileboeth.hush.contract.DaemonStatus
 import com.aileboeth.hush.contract.DiagnosticLogEntry
 import com.aileboeth.hush.contract.GuardController
@@ -124,8 +128,8 @@ class FakeGuardController : GuardController {
                 lastForegroundMs = now - 4 * 60_000L,
             ),
             ManagedAppInfo(
-                packageName = "com.example.messenger.clone",
-                label = "即时通讯 (双开)",
+                packageName = "com.example.messenger",
+                label = "即时通讯示例",
                 userId = 999,
                 group = AppGroup.PROTECTED,
                 running = true,
@@ -209,6 +213,18 @@ class FakeGuardController : GuardController {
     )
     override val secondaryUsers: StateFlow<List<SecondaryUserInfo>> = _secondaryUsers.asStateFlow()
 
+    private val _customGroups = MutableStateFlow(
+        listOf(
+            CustomAppGroup(
+                id = "demo_kill",
+                name = "娱乐强杀",
+                action = AppGroup.FORCE_STOP,
+                appKeys = listOf("com.example.shortvideo", "com.example.shopping"),
+            ),
+        )
+    )
+    override val customGroups: StateFlow<List<CustomAppGroup>> = _customGroups.asStateFlow()
+
     override suspend fun reconnect(): Result<Unit> {
         _daemonStatus.value = DaemonStatus.Connecting
         delay(250)
@@ -230,10 +246,35 @@ class FakeGuardController : GuardController {
         return Result.success(Unit)
     }
 
-    override suspend fun setAppGroup(packageName: String, group: AppGroup): Result<Unit> {
+    override suspend fun setAppGroup(packageName: String, group: AppGroup, userId: Int): Result<Unit> {
         _managedApps.update { list ->
-            list.map { if (it.packageName == packageName) it.copy(group = group) else it }
+            list.map {
+                if (it.packageName == packageName && it.userId == userId) it.copy(group = group) else it
+            }
         }
+        return Result.success(Unit)
+    }
+
+    override suspend fun setAppGroupsBatch(updates: Map<String, AppGroup>): Result<Unit> {
+        _managedApps.update { list ->
+            list.map { app ->
+                val next = updates[app.appKey]
+                if (next != null) app.copy(group = next) else app
+            }
+        }
+        return Result.success(Unit)
+    }
+
+    override suspend fun saveCustomGroup(group: CustomAppGroup): Result<Unit> {
+        _customGroups.update { list ->
+            val idx = list.indexOfFirst { it.id == group.id }
+            if (idx >= 0) list.toMutableList().apply { set(idx, group) } else list + group
+        }
+        return Result.success(Unit)
+    }
+
+    override suspend fun deleteCustomGroup(groupId: String): Result<Unit> {
+        _customGroups.update { list -> list.filterNot { it.id == groupId } }
         return Result.success(Unit)
     }
 
@@ -242,13 +283,13 @@ class FakeGuardController : GuardController {
         return Result.success(Unit)
     }
 
-    override suspend fun forceStopNow(packageName: String): Result<Long> {
-        val target = _managedApps.value.firstOrNull { it.packageName == packageName }
+    override suspend fun forceStopNow(packageName: String, userId: Int): Result<Long> {
+        val target = _managedApps.value.firstOrNull { it.packageName == packageName && it.userId == userId }
             ?: return Result.failure(IllegalArgumentException("App not found"))
         val freed = target.totalPssKb
         _managedApps.update { list ->
             list.map {
-                if (it.packageName == packageName) {
+                if (it.packageName == packageName && it.userId == userId) {
                     it.copy(running = false, isFrozen = false, totalPssKb = 0L, swapPssKb = 0L, processCount = 0)
                 } else it
             }
@@ -264,13 +305,28 @@ class FakeGuardController : GuardController {
         return Result.success(freed)
     }
 
-    override suspend fun softTrimNow(packageName: String): Result<Long> {
-        val target = _managedApps.value.firstOrNull { it.packageName == packageName }
+    override suspend fun forceStopBatch(targets: List<AppTarget>): Result<BatchActionResult> {
+        var affected = 0
+        var freed = 0L
+        for (t in targets.distinct()) {
+            val cur = _managedApps.value.firstOrNull { it.packageName == t.packageName && it.userId == t.userId }
+            if (cur != null && cur.running) {
+                forceStopNow(t.packageName, t.userId).onSuccess {
+                    affected++
+                    freed += it
+                }
+            }
+        }
+        return Result.success(BatchActionResult(affectedCount = affected, freedKb = freed))
+    }
+
+    override suspend fun softTrimNow(packageName: String, userId: Int): Result<Long> {
+        val target = _managedApps.value.firstOrNull { it.packageName == packageName && it.userId == userId }
             ?: return Result.failure(IllegalArgumentException("App not found"))
         val freed = (target.totalPssKb * 35) / 100
         _managedApps.update { list ->
             list.map {
-                if (it.packageName == packageName) {
+                if (it.packageName == packageName && it.userId == userId) {
                     it.copy(
                         totalPssKb = (it.totalPssKb - freed).coerceAtLeast(150_000L),
                         processCount = it.processCount.coerceAtMost(2),
@@ -282,15 +338,30 @@ class FakeGuardController : GuardController {
         return Result.success(freed)
     }
 
-    override suspend fun setAppRestriction(packageName: String, restriction: AppRestriction): Result<Unit> {
-        val target = _managedApps.value.firstOrNull { it.packageName == packageName }
+    override suspend fun softTrimBatch(targets: List<AppTarget>): Result<BatchActionResult> {
+        var affected = 0
+        var freed = 0L
+        for (t in targets.distinct()) {
+            val cur = _managedApps.value.firstOrNull { it.packageName == t.packageName && it.userId == t.userId }
+            if (cur != null && cur.running) {
+                softTrimNow(t.packageName, t.userId).onSuccess {
+                    affected++
+                    freed += it
+                }
+            }
+        }
+        return Result.success(BatchActionResult(affectedCount = affected, freedKb = freed))
+    }
+
+    override suspend fun setAppRestriction(packageName: String, restriction: AppRestriction, userId: Int): Result<Unit> {
+        val target = _managedApps.value.firstOrNull { it.packageName == packageName && it.userId == userId }
             ?: return Result.failure(IllegalArgumentException("App not found"))
         if (restriction.hasAnyRestriction && SafetyGuardrails.isRestrictionBlocked(packageName, target.group)) {
             return Result.failure(SecurityException("保消息瘦身档与保护档禁止限制后台"))
         }
         _managedApps.update { list ->
             list.map {
-                if (it.packageName == packageName) {
+                if (it.packageName == packageName && it.userId == userId) {
                     it.copy(
                         running = if (restriction.disableApp) false else it.running,
                         totalPssKb = if (restriction.disableApp) 0L else it.totalPssKb,

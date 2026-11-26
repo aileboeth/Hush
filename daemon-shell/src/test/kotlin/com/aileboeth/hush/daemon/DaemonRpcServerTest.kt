@@ -2,6 +2,7 @@ package com.aileboeth.hush.daemon
 
 import com.aileboeth.hush.contract.AppRestriction
 import com.aileboeth.hush.contract.AppRuntimeSample
+import com.aileboeth.hush.contract.AppTarget
 import com.aileboeth.hush.contract.HushProtocol
 import com.aileboeth.hush.contract.MemoryOverview
 import com.aileboeth.hush.contract.MiniJson
@@ -34,7 +35,13 @@ class DaemonRpcServerTest {
         override fun isScreenAwake() = true
         override fun getActiveAudioPackages() = emptySet<String>()
         override fun listUserPackages() = emptySet<String>()
-        override fun samplePackage(packageName: String, userId: Int) = AppRuntimeSample(packageName, userId)
+        override fun listClonePackages() = listOf(AppTarget("com.tencent.mm", 999))
+        override fun samplePackage(packageName: String, userId: Int) = AppRuntimeSample(
+            packageName = packageName,
+            userId = userId,
+            running = packageName == "com.tencent.mm",
+            totalPssKb = if (userId == 999) 420_000L else 500_000L,
+        )
         override fun forceStop(packageName: String, userId: Int) = true
         override fun softTrim(packageName: String, userId: Int) = true
         override fun applyRestriction(packageName: String, restriction: AppRestriction, userId: Int) = true
@@ -100,6 +107,31 @@ class DaemonRpcServerTest {
                 val diagReply = MiniJson.parseObject(r.readLine())
                 assertTrue(diagReply.boolVal("ok"))
                 assertTrue((diagReply.obj("data")?.listOfObj("entries")?.size ?: 0) >= 1)
+
+                w.write(MiniJson.stringify(mapOf("method" to HushProtocol.METHOD_GET_CLONE_PACKAGES)))
+                w.newLine(); w.flush()
+                val cloneReply = MiniJson.parseObject(r.readLine())
+                assertTrue(cloneReply.boolVal("ok"))
+                assertEquals(1, cloneReply.obj("data")?.listOfObj("packages")?.size)
+                assertEquals(999, cloneReply.obj("data")?.listOfObj("packages")?.first()?.intVal("userId"))
+
+                w.write(
+                    MiniJson.stringify(
+                        mapOf(
+                            "method" to HushProtocol.METHOD_FORCE_STOP_BATCH,
+                            "params" to mapOf(
+                                "targets" to listOf(
+                                    mapOf("packageName" to "com.tencent.mm", "userId" to 999),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+                w.newLine(); w.flush()
+                val batchReply = MiniJson.parseObject(r.readLine())
+                assertTrue(batchReply.boolVal("ok"))
+                assertEquals(1, batchReply.obj("data")?.intVal("affectedCount"))
+                assertEquals(420_000L, batchReply.obj("data")?.longVal("freedKb"))
             }
 
             // 3. Abrupt client disconnect mid-stream must NOT crash server; next connection still succeeds

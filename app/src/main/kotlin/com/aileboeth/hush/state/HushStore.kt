@@ -3,7 +3,10 @@ package com.aileboeth.hush.state
 import android.content.Context
 import com.aileboeth.hush.BuildConfig
 import com.aileboeth.hush.contract.AppGroup
+import com.aileboeth.hush.contract.AppKey
 import com.aileboeth.hush.contract.AppRestriction
+import com.aileboeth.hush.contract.AppTarget
+import com.aileboeth.hush.contract.CustomAppGroup
 import com.aileboeth.hush.contract.DaemonStatus
 import com.aileboeth.hush.contract.HushGraph
 import com.aileboeth.hush.contract.HushLog
@@ -104,6 +107,15 @@ class HushStore(
         }
 
         scope.launch {
+            guard.customGroups.collect { groups ->
+                _uiState.update { cur ->
+                    val validSelectedId = cur.selectedCustomGroupId?.takeIf { id -> groups.any { it.id == id } }
+                    cur.copy(customGroups = groups, selectedCustomGroupId = validSelectedId)
+                }
+            }
+        }
+
+        scope.launch {
             combine(
                 bootstrap.state,
                 bootstrap.hasPairedBefore,
@@ -199,7 +211,22 @@ class HushStore(
     }
 
     fun navigateToAppsWithFilter(filter: AppFilterMode) {
-        _uiState.update { it.copy(activeTab = HushTab.APPS, appFilter = filter) }
+        _uiState.update {
+            it.copy(
+                activeTab = HushTab.APPS,
+                appFilter = filter,
+                selectedCustomGroupId = null,
+            )
+        }
+    }
+
+    fun navigateToAppsWithCustomGroup(groupId: String) {
+        _uiState.update {
+            it.copy(
+                activeTab = HushTab.APPS,
+                selectedCustomGroupId = groupId,
+            )
+        }
     }
 
     fun cycleThemePreference() {
@@ -244,7 +271,11 @@ class HushStore(
     }
 
     fun setAppFilter(filter: AppFilterMode) {
-        _uiState.update { it.copy(appFilter = filter) }
+        _uiState.update { it.copy(appFilter = filter, selectedCustomGroupId = null) }
+    }
+
+    fun selectCustomGroup(groupId: String?) {
+        _uiState.update { it.copy(selectedCustomGroupId = groupId) }
     }
 
     fun setAppSort(sort: AppSortMode) {
@@ -255,12 +286,24 @@ class HushStore(
         _uiState.update { it.copy(appSearchQuery = query) }
     }
 
-    fun openAppDetail(packageName: String) {
-        _uiState.update { it.copy(selectedAppPackage = packageName) }
+    fun openAppDetail(appKey: String) {
+        _uiState.update { it.copy(selectedAppKey = appKey) }
     }
 
     fun closeAppDetail() {
-        _uiState.update { it.copy(selectedAppPackage = null) }
+        _uiState.update { it.copy(selectedAppKey = null) }
+    }
+
+    fun openBuiltInGroupEditor(tier: AppGroup) {
+        _uiState.update { it.copy(groupEditorTarget = GroupEditorTarget.BuiltInTier(tier)) }
+    }
+
+    fun openCustomGroupEditor(group: CustomAppGroup? = null, preselectedAppKeys: Set<String> = emptySet()) {
+        _uiState.update { it.copy(groupEditorTarget = GroupEditorTarget.Custom(group, preselectedAppKeys)) }
+    }
+
+    fun closeGroupEditor() {
+        _uiState.update { it.copy(groupEditorTarget = null) }
     }
 
     fun setActivityFilter(filter: ActivityFilterMode) {
@@ -292,9 +335,9 @@ class HushStore(
         }
     }
 
-    fun setAppGroup(packageName: String, appLabel: String, group: AppGroup) {
+    fun setAppGroup(packageName: String, appLabel: String, group: AppGroup, userId: Int = 0) {
         scope.launch {
-            val res = guard.setAppGroup(packageName, group)
+            val res = guard.setAppGroup(packageName, group, userId)
             res.fold(
                 onSuccess = {
                     val label = when (group) {
@@ -310,12 +353,136 @@ class HushStore(
         }
     }
 
-    fun forceStopNow(packageName: String, appLabel: String) {
-        if (packageName in _uiState.value.busyPackages) return
+    fun saveBuiltInGroupMembers(tier: AppGroup, selectedKeys: Set<String>) {
         scope.launch {
-            _uiState.update { it.copy(busyPackages = it.busyPackages + packageName) }
-            val res = guard.forceStopNow(packageName)
-            _uiState.update { it.copy(busyPackages = it.busyPackages - packageName) }
+            val currentApps = _uiState.value.managedApps
+            val updates = LinkedHashMap<String, AppGroup>()
+            val removedKeys = HashSet<String>()
+            for (app in currentApps) {
+                if (app.isSystemProtected) continue
+                val wasInTier = app.group == tier
+                val nowInTier = app.appKey in selectedKeys
+                if (nowInTier && !wasInTier) {
+                    updates[app.appKey] = tier
+                } else if (!nowInTier && wasInTier) {
+                    updates[app.appKey] = AppGroup.UNSET
+                    removedKeys.add(app.appKey)
+                }
+            }
+            // If an unchecked app inherited this tier from a custom group of the same action, remove it there too
+            if (removedKeys.isNotEmpty()) {
+                for (cg in _uiState.value.customGroups) {
+                    if (cg.action == tier && cg.appKeys.any { it in removedKeys }) {
+                        guard.saveCustomGroup(cg.copy(appKeys = cg.appKeys.filterNot { it in removedKeys }))
+                    }
+                }
+            }
+            val res = guard.setAppGroupsBatch(updates)
+            _uiState.update { it.copy(groupEditorTarget = null) }
+            res.fold(
+                onSuccess = {
+                    val name = when (tier) {
+                        AppGroup.FORCE_STOP -> "强杀组"
+                        AppGroup.SOFT_TRIM -> "保消息瘦身组"
+                        AppGroup.PROTECTED -> "常驻保护组"
+                        AppGroup.UNSET -> "未分类"
+                    }
+                    notify("已更新「$name」成员（共 ${selectedKeys.size} 个）")
+                },
+                onFailure = { err -> notify(err.message ?: "更新成员失败", isError = true) },
+            )
+        }
+    }
+
+    fun saveCustomGroup(group: CustomAppGroup, selectAfterSave: Boolean = true) {
+        scope.launch {
+            val res = guard.saveCustomGroup(group)
+            res.fold(
+                onSuccess = {
+                    _uiState.update { cur ->
+                        cur.copy(
+                            groupEditorTarget = null,
+                            selectedCustomGroupId = if (selectAfterSave) group.id else cur.selectedCustomGroupId,
+                        )
+                    }
+                    notify("已保存分组「${group.name}」（${group.appKeys.size} 个应用）")
+                },
+                onFailure = { err -> notify(err.message ?: "保存分组失败", isError = true) },
+            )
+        }
+    }
+
+    fun deleteCustomGroup(group: CustomAppGroup) {
+        scope.launch {
+            val res = guard.deleteCustomGroup(group.id)
+            res.fold(
+                onSuccess = {
+                    _uiState.update { cur ->
+                        cur.copy(
+                            groupEditorTarget = null,
+                            selectedCustomGroupId = if (cur.selectedCustomGroupId == group.id) null else cur.selectedCustomGroupId,
+                        )
+                    }
+                    notify("已删除分组「${group.name}」")
+                },
+                onFailure = { err -> notify(err.message ?: "删除分组失败", isError = true) },
+            )
+        }
+    }
+
+    fun toggleAppInCustomGroup(groupId: String, appKey: String) {
+        val group = _uiState.value.customGroups.firstOrNull { it.id == groupId } ?: return
+        val nextKeys = if (appKey in group.appKeys) {
+            group.appKeys.filterNot { it == appKey }
+        } else {
+            group.appKeys + appKey
+        }
+        scope.launch {
+            guard.saveCustomGroup(group.copy(appKeys = nextKeys)).fold(
+                onSuccess = {
+                    val added = appKey in nextKeys
+                    notify(if (added) "已加入分组「${group.name}」" else "已移出分组「${group.name}」")
+                },
+                onFailure = { err -> notify(err.message ?: "更新分组失败", isError = true) },
+            )
+        }
+    }
+
+    fun executeGroupAction(groupName: String, action: AppGroup, targets: List<AppTarget>) {
+        if (_uiState.value.isGlobalActionBusy) return
+        if (targets.isEmpty()) {
+            notify("「$groupName」内暂无可操作的应用")
+            return
+        }
+        scope.launch {
+            _uiState.update { it.copy(isGlobalActionBusy = true) }
+            val res = when (action) {
+                AppGroup.SOFT_TRIM -> guard.softTrimBatch(targets)
+                else -> guard.forceStopBatch(targets)
+            }
+            _uiState.update { it.copy(isGlobalActionBusy = false) }
+            res.fold(
+                onSuccess = { batch ->
+                    val verb = if (action == AppGroup.SOFT_TRIM) "瘦身" else "强杀"
+                    if (batch.affectedCount == 0) {
+                        notify("「$groupName」当前没有运行中的应用")
+                    } else {
+                        val freedText = if (batch.freedKb > 0L) " · 释放 ${formatMemoryKb(batch.freedKb)}" else ""
+                        notify("已$verb「$groupName」${batch.affectedCount} 个应用$freedText")
+                    }
+                },
+                onFailure = { err -> notify(err.message ?: "批量执行失败", isError = true) },
+            )
+        }
+    }
+
+    fun forceStopNow(packageName: String, appLabel: String, userId: Int = 0) {
+        val key = AppKey.encode(packageName, userId)
+        if (key in _uiState.value.busyPackages) return
+        scope.launch {
+            _uiState.update { it.copy(busyPackages = it.busyPackages + key) }
+            val res = guard.forceStopNow(packageName, userId)
+            _uiState.update { it.copy(busyPackages = it.busyPackages - key) }
             res.fold(
                 onSuccess = { freedKb ->
                     val detail = if (freedKb > 0L) " · 释放 ${formatMemoryKb(freedKb)}" else ""
@@ -326,12 +493,13 @@ class HushStore(
         }
     }
 
-    fun softTrimNow(packageName: String, appLabel: String) {
-        if (packageName in _uiState.value.busyPackages) return
+    fun softTrimNow(packageName: String, appLabel: String, userId: Int = 0) {
+        val key = AppKey.encode(packageName, userId)
+        if (key in _uiState.value.busyPackages) return
         scope.launch {
-            _uiState.update { it.copy(busyPackages = it.busyPackages + packageName) }
-            val res = guard.softTrimNow(packageName)
-            _uiState.update { it.copy(busyPackages = it.busyPackages - packageName) }
+            _uiState.update { it.copy(busyPackages = it.busyPackages + key) }
+            val res = guard.softTrimNow(packageName, userId)
+            _uiState.update { it.copy(busyPackages = it.busyPackages - key) }
             res.fold(
                 onSuccess = { freedKb ->
                     val detail = if (freedKb > 0L) " · 释放 ${formatMemoryKb(freedKb)}" else " · 推送保持活跃"
@@ -342,13 +510,14 @@ class HushStore(
         }
     }
 
-    fun setAppRestriction(packageName: String, restriction: AppRestriction) {
-        if (packageName in _uiState.value.busyPackages) return
-        val prev = _uiState.value.managedApps.firstOrNull { it.packageName == packageName }?.restriction
+    fun setAppRestriction(packageName: String, restriction: AppRestriction, userId: Int = 0) {
+        val key = AppKey.encode(packageName, userId)
+        if (key in _uiState.value.busyPackages) return
+        val prev = _uiState.value.managedApps.firstOrNull { it.appKey == key }?.restriction
         scope.launch {
-            _uiState.update { it.copy(busyPackages = it.busyPackages + packageName) }
-            val res = guard.setAppRestriction(packageName, restriction)
-            _uiState.update { it.copy(busyPackages = it.busyPackages - packageName) }
+            _uiState.update { it.copy(busyPackages = it.busyPackages + key) }
+            val res = guard.setAppRestriction(packageName, restriction, userId)
+            _uiState.update { it.copy(busyPackages = it.busyPackages - key) }
             res.fold(
                 onSuccess = {
                     val msg = when {

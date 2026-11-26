@@ -2,6 +2,7 @@ package com.aileboeth.hush.daemon
 
 import com.aileboeth.hush.contract.AppRestriction
 import com.aileboeth.hush.contract.AppRuntimeSample
+import com.aileboeth.hush.contract.AppTarget
 import com.aileboeth.hush.contract.MemoryOverview
 import com.aileboeth.hush.contract.SecondaryUserInfo
 import com.aileboeth.hush.contract.StandbyBucket
@@ -18,6 +19,7 @@ interface SystemBridge {
 
     fun readMemoryOverview(): MemoryOverview
     fun getForegroundPackage(): String?
+    fun getForegroundTarget(): AppTarget? = getForegroundPackage()?.let { AppTarget(it, 0) }
     fun isScreenAwake(): Boolean
 
     /**
@@ -25,8 +27,12 @@ interface SystemBridge {
      * Must exclude frozen processes and stale `active=true` MediaSessions without PLAYING state.
      */
     fun getActiveAudioPackages(): Set<String>
+    fun getActiveAudioTargets(): Set<AppTarget> = getActiveAudioPackages().mapTo(LinkedHashSet()) { AppTarget(it, 0) }
 
     fun listUserPackages(): Set<String>
+
+    /** Lists cloned/dual-space app instances installed in clone profiles (e.g., Xspace / MultiApp user 999). */
+    fun listClonePackages(): List<AppTarget> = emptyList()
 
     /**
      * Single-package sample (used for before/after measurements on manual/single actions).
@@ -41,6 +47,20 @@ interface SystemBridge {
         val out = LinkedHashMap<String, AppRuntimeSample>(packages.size)
         for (pkg in packages) {
             out[pkg] = samplePackage(pkg, userId)
+        }
+        return out
+    }
+
+    /**
+     * O(1) multi-user batch snapshot across both primary (`user 0`) and clone (`user 999`, etc.) targets.
+     */
+    fun sampleTargetsBatch(targets: List<AppTarget>): Map<AppTarget, AppRuntimeSample> {
+        val out = LinkedHashMap<AppTarget, AppRuntimeSample>(targets.size)
+        for ((uid, group) in targets.groupBy { it.userId }) {
+            val batch = samplePackagesBatch(group.map { it.packageName }.distinct(), userId = uid)
+            for (t in group) {
+                out[t] = batch[t.packageName] ?: AppRuntimeSample(packageName = t.packageName, userId = uid)
+            }
         }
         return out
     }

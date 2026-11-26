@@ -13,6 +13,7 @@ interface GuardController {
     val policyConfig: StateFlow<PolicyConfig>
     val cleanupLogs: StateFlow<List<CleanupEvent>>
     val secondaryUsers: StateFlow<List<SecondaryUserInfo>>
+    val customGroups: StateFlow<List<CustomAppGroup>>
 
     /** Attempt to reconnect to a running daemon using persisted session credentials. */
     suspend fun reconnect(): Result<Unit>
@@ -20,20 +21,35 @@ interface GuardController {
     /** Refresh system RAM/ZRAM snapshot, running app memory footprints, and recent logs. */
     suspend fun refreshSnapshot(): Result<Unit>
 
-    /** Assign an app to [AppGroup.FORCE_STOP], [AppGroup.SOFT_TRIM], [AppGroup.PROTECTED], or [AppGroup.UNSET]. */
-    suspend fun setAppGroup(packageName: String, group: AppGroup): Result<Unit>
+    /** Assign an app instance to [AppGroup.FORCE_STOP], [AppGroup.SOFT_TRIM], [AppGroup.PROTECTED], or [AppGroup.UNSET]. */
+    suspend fun setAppGroup(packageName: String, group: AppGroup, userId: Int = 0): Result<Unit>
+
+    /** Batch-assign multiple app keys (`pkg` or `pkg@userId`) to target tiers in one atomic sync. */
+    suspend fun setAppGroupsBatch(updates: Map<String, AppGroup>): Result<Unit>
+
+    /** Create or update a user-defined custom app group. */
+    suspend fun saveCustomGroup(group: CustomAppGroup): Result<Unit>
+
+    /** Delete a user-defined custom app group by ID. */
+    suspend fun deleteCustomGroup(groupId: String): Result<Unit>
 
     /** Update global automated policy settings and immediately push them to the running daemon. */
     suspend fun updatePolicy(config: PolicyConfig): Result<Unit>
 
-    /** Immediately `force-stop` an app (rejected for system-protected packages). Returns freed KB. */
-    suspend fun forceStopNow(packageName: String): Result<Long>
+    /** Immediately `force-stop` an app instance (rejected for system-protected packages). Returns freed KB. */
+    suspend fun forceStopNow(packageName: String, userId: Int = 0): Result<Long>
 
-    /** Immediately run push-safe soft trim (`trim-memory` + `am kill`). Returns freed KB. */
-    suspend fun softTrimNow(packageName: String): Result<Long>
+    /** Immediately `force-stop` a batch of app targets (e.g. a whole group). */
+    suspend fun forceStopBatch(targets: List<AppTarget>): Result<BatchActionResult>
 
-    /** Toggle reversible appops/standby-bucket restrictions on a single package. */
-    suspend fun setAppRestriction(packageName: String, restriction: AppRestriction): Result<Unit>
+    /** Immediately run push-safe soft trim (`trim-memory`). Returns freed KB. */
+    suspend fun softTrimNow(packageName: String, userId: Int = 0): Result<Long>
+
+    /** Immediately run push-safe soft trim across a batch of app targets. */
+    suspend fun softTrimBatch(targets: List<AppTarget>): Result<BatchActionResult>
+
+    /** Toggle reversible appops/standby-bucket restrictions on a single app instance. */
+    suspend fun setAppRestriction(packageName: String, restriction: AppRestriction, userId: Int = 0): Result<Unit>
 
     /** Revert every appops/standby-bucket modification recorded in the ledger. Returns restored count. */
     suspend fun restoreAllRestrictions(): Result<Int>

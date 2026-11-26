@@ -2,8 +2,11 @@ package com.aileboeth.hush.daemon
 
 import com.aileboeth.hush.contract.AppConfigSnapshot
 import com.aileboeth.hush.contract.AppGroup
+import com.aileboeth.hush.contract.AppKey
 import com.aileboeth.hush.contract.AppRestriction
 import com.aileboeth.hush.contract.AppRuntimeSample
+import com.aileboeth.hush.contract.AppTarget
+import com.aileboeth.hush.contract.BatchActionResult
 import com.aileboeth.hush.contract.CleanupAction
 import com.aileboeth.hush.contract.CleanupEvent
 import com.aileboeth.hush.contract.CleanupTrigger
@@ -18,6 +21,8 @@ import java.util.concurrent.atomic.AtomicLong
 
 /**
  * In-daemon automated policy engine running at `uid=2000`.
+ * Supports primary (`user 0`), clone/dual-space (`user 999`, etc.), built-in tiers,
+ * custom app groups, batch group actions, and secondary Android user whole-space stop.
  */
 class PolicyEngine(
     private val bridge: SystemBridge,
@@ -29,26 +34,30 @@ class PolicyEngine(
     @Volatile
     private var config: AppConfigSnapshot = initialConfig
 
-    private var currentForegroundPkg: String? = null
+    private var currentForeground: AppTarget? = null
     private var lastObservedUserId: Int = 0
     private val secondaryUserLeftMs = ConcurrentHashMap<Int, Long>()
-    private val lastForegroundMs = ConcurrentHashMap<String, Long>()
-    private val lastSoftTrimMs = ConcurrentHashMap<String, Long>()
+    private val lastForegroundMs = ConcurrentHashMap<AppTarget, Long>()
+    private val lastSoftTrimMs = ConcurrentHashMap<AppTarget, Long>()
     private var screenOffSinceMs: Long? = null
     private var screenOffCleanupExecuted: Boolean = false
 
     private val eventLog = ArrayDeque<CleanupEvent>(MAX_LOG_ENTRIES)
-    private val restrictionLedger = ConcurrentHashMap<String, AppRestriction>()
+    private val restrictionLedger = ConcurrentHashMap<AppTarget, AppRestriction>()
 
     init {
-        restrictionLedger.putAll(initialConfig.appliedRestrictions)
+        initialConfig.appliedRestrictions.forEach { (rawKey, r) ->
+            restrictionLedger[AppKey.decode(rawKey)] = r
+        }
     }
 
     fun updateConfig(newConfig: AppConfigSnapshot) {
         synchronized(lock) {
             config = newConfig
             restrictionLedger.clear()
-            restrictionLedger.putAll(newConfig.appliedRestrictions)
+            newConfig.appliedRestrictions.forEach { (rawKey, r) ->
+                restrictionLedger[AppKey.decode(rawKey)] = r
+            }
         }
     }
 
@@ -80,7 +89,7 @@ class PolicyEngine(
         val snap = config
         val now = bridge.nowMs()
         val currentUser = bridge.getCurrentUserId()
-        val fg = bridge.getForegroundPackage()
+        val fg = bridge.getForegroundTarget()
         val awake = bridge.isScreenAwake()
 
         if (currentUser != lastObservedUserId) {
@@ -94,10 +103,11 @@ class PolicyEngine(
         }
 
         if (fg != null) {
-            if (currentForegroundPkg != null && currentForegroundPkg != fg) {
-                lastForegroundMs[currentForegroundPkg!!] = now
+            val prevFg = currentForeground
+            if (prevFg != null && prevFg != fg) {
+                lastForegroundMs[prevFg] = now
             }
-            currentForegroundPkg = fg
+            currentForeground = fg
             lastForegroundMs[fg] = now
         }
 
@@ -113,22 +123,31 @@ class PolicyEngine(
 
         if (!snap.policy.enabled) return
 
-        // Always evaluate secondary Android user auto-stop even when zero user-0 apps are tagged
+        // Always evaluate secondary Android user auto-stop even when zero apps are tagged
         evaluateSecondaryUsers(snap.policy, currentUser, awake, now)
 
-        val managedEntries = snap.appGroups.filterValues {
+        val effectiveGroups = snap.resolveEffectiveGroups().toMutableMap()
+        if (snap.policy.softTrimIncludeDualSpace) {
+            for (clone in bridge.listClonePackages()) {
+                if (clone !in effectiveGroups && effectiveGroups[AppTarget(clone.packageName, 0)] == AppGroup.SOFT_TRIM) {
+                    effectiveGroups[clone] = AppGroup.SOFT_TRIM
+                }
+            }
+        }
+
+        val managedEntries = effectiveGroups.filterValues {
             it == AppGroup.FORCE_STOP || it == AppGroup.SOFT_TRIM
         }
         if (managedEntries.isEmpty()) return
 
         val activeAudio = if (snap.policy.exemptActiveAudio) {
-            bridge.getActiveAudioPackages()
+            bridge.getActiveAudioTargets()
         } else {
             emptySet()
         }
 
-        // Single batch snapshot for all managed apps so tick stays O(1) in shell forks
-        val batchSamples = bridge.samplePackagesBatch(managedEntries.keys.toList(), userId = 0)
+        // Single multi-user O(1) batch snapshot across primary + clone targets
+        val batchSamples = bridge.sampleTargetsBatch(managedEntries.keys.toList())
 
         // 1. Screen-off batch cleanup (runs once after screenOffDelayMinutes)
         val offSince = screenOffSinceMs
@@ -153,39 +172,39 @@ class PolicyEngine(
 
         // 2. Per-app background timeout cleanup
         val timeoutMs = snap.policy.backgroundTimeoutMinutes * 60_000L
-        val evictedThisTick = HashSet<String>()
-        for ((pkg, group) in managedEntries) {
-            if (pkg == currentForegroundPkg) continue
-            if (SafetyGuardrails.isSystemProtected(pkg)) continue
+        val evictedThisTick = HashSet<AppTarget>()
+        for ((target, group) in managedEntries) {
+            if (target == currentForeground) continue
+            if (SafetyGuardrails.isSystemProtected(target.packageName)) continue
 
-            val sample = batchSamples[pkg]
+            val sample = batchSamples[target]
             if (sample == null || !sample.running) {
-                lastForegroundMs.remove(pkg)
+                lastForegroundMs.remove(target)
                 continue
             }
 
-            val lastFg = lastForegroundMs[pkg]
+            val lastFg = lastForegroundMs[target]
             if (lastFg == null) {
-                lastForegroundMs[pkg] = now
+                lastForegroundMs[target] = now
                 continue
             }
             if ((now - lastFg) < timeoutMs) continue
 
             if (group == AppGroup.SOFT_TRIM) {
-                val lastTrim = lastSoftTrimMs[pkg] ?: 0L
+                val lastTrim = lastSoftTrimMs[target] ?: 0L
                 if (now - lastTrim < timeoutMs) continue
             }
 
-            if (snap.policy.exemptActiveAudio && pkg in activeAudio) {
+            if (snap.policy.exemptActiveAudio && target in activeAudio) {
                 continue
             }
 
             when (group) {
                 AppGroup.FORCE_STOP -> {
-                    executeForceStop(pkg, sample.totalPssKb, CleanupTrigger.BACKGROUND_TIMEOUT, now)
-                    evictedThisTick.add(pkg)
+                    executeForceStop(target, sample.totalPssKb, CleanupTrigger.BACKGROUND_TIMEOUT, now)
+                    evictedThisTick.add(target)
                 }
-                AppGroup.SOFT_TRIM -> executeSoftTrim(pkg, sample.totalPssKb, CleanupTrigger.BACKGROUND_TIMEOUT, now)
+                AppGroup.SOFT_TRIM -> executeSoftTrim(target, sample.totalPssKb, CleanupTrigger.BACKGROUND_TIMEOUT, now)
                 else -> Unit
             }
         }
@@ -196,16 +215,17 @@ class PolicyEngine(
         }
     }
 
-    fun manualForceStop(packageName: String): Result<Long> {
+    fun manualForceStop(packageName: String, userId: Int = 0): Result<Long> {
         if (SafetyGuardrails.isSystemProtected(packageName)) {
             return Result.failure(SecurityException("系统关键组件受保护，不能强杀"))
         }
-        val before = bridge.samplePackage(packageName, userId = 0)
-        val ok = bridge.forceStop(packageName, userId = 0)
+        val target = AppTarget(packageName, userId)
+        val before = bridge.samplePackage(packageName, userId = userId)
+        val ok = bridge.forceStop(packageName, userId = userId)
         if (!ok) return Result.failure(IllegalStateException("强杀 $packageName 失败"))
         val freed = before.totalPssKb.coerceAtLeast(0L)
-        recordEvent(
-            packageName = packageName,
+        recordTargetEvent(
+            target = target,
             action = CleanupAction.FORCE_STOP,
             trigger = CleanupTrigger.MANUAL,
             freedKb = freed,
@@ -213,18 +233,53 @@ class PolicyEngine(
         return Result.success(freed)
     }
 
-    fun manualSoftTrim(packageName: String): Result<Long> {
+    fun manualForceStopBatch(targets: List<AppTarget>): Result<BatchActionResult> {
+        val unique = targets.distinct()
+        if (unique.isEmpty()) return Result.success(BatchActionResult())
+        val batchSamples = bridge.sampleTargetsBatch(unique)
+        var affected = 0
+        var skipped = 0
+        var freedTotal = 0L
+        val now = bridge.nowMs()
+        for (target in unique) {
+            if (SafetyGuardrails.isSystemProtected(target.packageName)) {
+                skipped++
+                continue
+            }
+            val sample = batchSamples[target]
+            if (sample == null || !sample.running) continue
+            if (bridge.forceStop(target.packageName, userId = target.userId)) {
+                val freed = sample.totalPssKb.coerceAtLeast(0L)
+                affected++
+                freedTotal += freed
+                recordTargetEvent(
+                    target = target,
+                    action = CleanupAction.FORCE_STOP,
+                    trigger = CleanupTrigger.MANUAL,
+                    freedKb = freed,
+                    timestampMs = now,
+                )
+            } else {
+                skipped++
+            }
+        }
+        HushLog.i("Policy", "Batch force-stop count=$affected skipped=$skipped freedKb=$freedTotal")
+        return Result.success(BatchActionResult(affectedCount = affected, skippedCount = skipped, freedKb = freedTotal))
+    }
+
+    fun manualSoftTrim(packageName: String, userId: Int = 0): Result<Long> {
         if (SafetyGuardrails.isSystemProtected(packageName)) {
             return Result.failure(SecurityException("系统关键组件受保护，不能操作"))
         }
-        val before = bridge.samplePackage(packageName, userId = 0)
-        val ok = bridge.softTrim(packageName, userId = 0)
+        val target = AppTarget(packageName, userId)
+        val before = bridge.samplePackage(packageName, userId = userId)
+        val ok = bridge.softTrim(packageName, userId = userId)
         if (!ok) return Result.failure(IllegalStateException("为 $packageName 温和瘦身失败"))
-        val after = bridge.samplePackage(packageName, userId = 0)
+        val after = bridge.samplePackage(packageName, userId = userId)
         val freed = (before.totalPssKb - after.totalPssKb).coerceAtLeast(0L)
-        lastSoftTrimMs[packageName] = bridge.nowMs()
-        recordEvent(
-            packageName = packageName,
+        lastSoftTrimMs[target] = bridge.nowMs()
+        recordTargetEvent(
+            target = target,
             action = CleanupAction.SOFT_TRIM,
             trigger = CleanupTrigger.MANUAL,
             freedKb = freed,
@@ -232,24 +287,61 @@ class PolicyEngine(
         return Result.success(freed)
     }
 
-    fun setRestriction(packageName: String, restriction: AppRestriction): Result<Unit> {
-        val group = config.appGroups[packageName] ?: AppGroup.UNSET
+    fun manualSoftTrimBatch(targets: List<AppTarget>): Result<BatchActionResult> {
+        val unique = targets.distinct()
+        if (unique.isEmpty()) return Result.success(BatchActionResult())
+        val batchSamples = bridge.sampleTargetsBatch(unique)
+        var affected = 0
+        var skipped = 0
+        var freedTotal = 0L
+        val now = bridge.nowMs()
+        for (target in unique) {
+            if (SafetyGuardrails.isSystemProtected(target.packageName)) {
+                skipped++
+                continue
+            }
+            val before = batchSamples[target]
+            if (before == null || !before.running) continue
+            if (bridge.softTrim(target.packageName, userId = target.userId)) {
+                lastSoftTrimMs[target] = now
+                val after = bridge.samplePackage(target.packageName, userId = target.userId)
+                val freed = (before.totalPssKb - after.totalPssKb).coerceAtLeast(0L)
+                affected++
+                freedTotal += freed
+                recordTargetEvent(
+                    target = target,
+                    action = CleanupAction.SOFT_TRIM,
+                    trigger = CleanupTrigger.MANUAL,
+                    freedKb = freed,
+                    timestampMs = now,
+                )
+            } else {
+                skipped++
+            }
+        }
+        HushLog.i("Policy", "Batch soft-trim count=$affected skipped=$skipped freedKb=$freedTotal")
+        return Result.success(BatchActionResult(affectedCount = affected, skippedCount = skipped, freedKb = freedTotal))
+    }
+
+    fun setRestriction(packageName: String, restriction: AppRestriction, userId: Int = 0): Result<Unit> {
+        val target = AppTarget(packageName, userId)
+        val group = config.resolveEffectiveGroups()[target] ?: AppGroup.UNSET
         if (restriction.hasAnyRestriction && SafetyGuardrails.isRestrictionBlocked(packageName, group)) {
             return Result.failure(SecurityException("保消息瘦身档与保护档不允许限制后台，以防漏消息"))
         }
-        val ok = bridge.applyRestriction(packageName, restriction, userId = 0)
+        val ok = bridge.applyRestriction(packageName, restriction, userId = userId)
         if (!ok) {
             val reason = bridge.lastRestrictionError() ?: "修改 $packageName 的后台限制失败"
             return Result.failure(IllegalStateException(reason))
         }
 
         if (restriction.hasAnyRestriction) {
-            restrictionLedger[packageName] = restriction
+            restrictionLedger[target] = restriction
         } else {
-            restrictionLedger.remove(packageName)
+            restrictionLedger.remove(target)
         }
-        recordEvent(
-            packageName = packageName,
+        recordTargetEvent(
+            target = target,
             action = CleanupAction.RESTRICT_CHANGED,
             trigger = CleanupTrigger.MANUAL,
             freedKb = 0L,
@@ -258,11 +350,11 @@ class PolicyEngine(
     }
 
     fun restoreAllRestrictions(): Result<Int> {
-        val packages = restrictionLedger.keys.toList()
+        val targets = restrictionLedger.keys.toList()
         var restored = 0
-        for (pkg in packages) {
-            if (bridge.applyRestriction(pkg, AppRestriction(), userId = 0)) {
-                restrictionLedger.remove(pkg)
+        for (target in targets) {
+            if (bridge.applyRestriction(target.packageName, AppRestriction(), userId = target.userId)) {
+                restrictionLedger.remove(target)
                 restored++
             }
         }
@@ -275,17 +367,23 @@ class PolicyEngine(
         return Result.success(restored)
     }
 
-    fun samplePackages(packages: List<String>): List<AppRuntimeSample> {
-        val activeAudio = bridge.getActiveAudioPackages()
-        val batch = bridge.samplePackagesBatch(packages, userId = 0)
-        return packages.map { pkg ->
-            val sample = batch[pkg] ?: AppRuntimeSample(packageName = pkg, userId = 0)
+    fun samplePackages(packages: List<String>): List<AppRuntimeSample> =
+        sampleTargets(packages.map { AppTarget(it, 0) })
+
+    fun sampleTargets(targets: List<AppTarget>): List<AppRuntimeSample> {
+        if (targets.isEmpty()) return emptyList()
+        val activeAudio = bridge.getActiveAudioTargets()
+        val batch = bridge.sampleTargetsBatch(targets)
+        return targets.map { target ->
+            val sample = batch[target] ?: AppRuntimeSample(packageName = target.packageName, userId = target.userId)
             sample.copy(
-                isPlayingAudio = pkg in activeAudio,
-                lastForegroundMs = lastForegroundMs[pkg] ?: 0L,
+                isPlayingAudio = target in activeAudio,
+                lastForegroundMs = lastForegroundMs[target] ?: 0L,
             )
         }
     }
+
+    fun listClonePackages(): List<AppTarget> = bridge.listClonePackages()
 
     fun readMemory(): MemoryOverview = bridge.readMemoryOverview()
 
@@ -343,7 +441,7 @@ class PolicyEngine(
                 secondaryUserLeftMs.remove(u.userId)
                 continue
             }
-            // Auto-stop strictly targets full secondary systems, never user 0, active user, clone 999, or Work Profile
+            // Auto-stop strictly targets full secondary systems, never user 0, active user, clone/Xspace, or Work Profile
             if (!u.canStop || u.userId == currentUser || !u.isFullSecondarySystem) continue
 
             if (!awake &&
@@ -385,37 +483,37 @@ class PolicyEngine(
     }
 
     private fun runBatchCleanup(
-        targets: Map<String, AppGroup>,
-        samples: Map<String, AppRuntimeSample>,
-        activeAudio: Set<String>,
+        targets: Map<AppTarget, AppGroup>,
+        samples: Map<AppTarget, AppRuntimeSample>,
+        activeAudio: Set<AppTarget>,
         trigger: CleanupTrigger,
         policy: PolicyConfig,
         now: Long,
         ignoreForeground: Boolean,
     ) {
-        for ((pkg, group) in targets) {
-            if (!ignoreForeground && pkg == currentForegroundPkg) continue
-            if (SafetyGuardrails.isSystemProtected(pkg)) continue
-            if (policy.exemptActiveAudio && pkg in activeAudio) {
-                recordEvent(pkg, groupToAction(group), trigger, 0L, skippedReason = "正在播放音频")
+        for ((target, group) in targets) {
+            if (!ignoreForeground && target == currentForeground) continue
+            if (SafetyGuardrails.isSystemProtected(target.packageName)) continue
+            if (policy.exemptActiveAudio && target in activeAudio) {
+                recordTargetEvent(target, groupToAction(group), trigger, 0L, skippedReason = "正在播放音频", timestampMs = now)
                 continue
             }
-            val sample = samples[pkg] ?: continue
+            val sample = samples[target] ?: continue
             if (!sample.running) continue
 
             when (group) {
-                AppGroup.FORCE_STOP -> executeForceStop(pkg, sample.totalPssKb, trigger, now)
-                AppGroup.SOFT_TRIM -> executeSoftTrim(pkg, sample.totalPssKb, trigger, now)
+                AppGroup.FORCE_STOP -> executeForceStop(target, sample.totalPssKb, trigger, now)
+                AppGroup.SOFT_TRIM -> executeSoftTrim(target, sample.totalPssKb, trigger, now)
                 else -> Unit
             }
         }
     }
 
     private fun evaluateMemoryPressure(
-        targets: Map<String, AppGroup>,
-        samples: Map<String, AppRuntimeSample>,
-        alreadyEvicted: Set<String>,
-        activeAudio: Set<String>,
+        targets: Map<AppTarget, AppGroup>,
+        samples: Map<AppTarget, AppRuntimeSample>,
+        alreadyEvicted: Set<AppTarget>,
+        activeAudio: Set<AppTarget>,
         policy: PolicyConfig,
         now: Long,
     ) {
@@ -423,33 +521,30 @@ class PolicyEngine(
         val minAvailKb = policy.minAvailableRamMb * 1024L
         var lowAvailableRam = mem.memAvailableKb > 0L && mem.memAvailableKb < minAvailKb
 
-        val runningForceStop = ArrayList<Pair<String, AppRuntimeSample>>()
+        val runningForceStop = ArrayList<Pair<AppTarget, AppRuntimeSample>>()
         var managedPssTotalKb = 0L
-        for ((pkg, group) in targets) {
+        for ((target, group) in targets) {
             if (group != AppGroup.FORCE_STOP) continue
-            if (pkg in alreadyEvicted || pkg == currentForegroundPkg) continue
-            if (SafetyGuardrails.isSystemProtected(pkg)) continue
-            if (policy.exemptActiveAudio && pkg in activeAudio) continue
-            val sample = samples[pkg] ?: continue
+            if (target in alreadyEvicted || target == currentForeground) continue
+            if (SafetyGuardrails.isSystemProtected(target.packageName)) continue
+            if (policy.exemptActiveAudio && target in activeAudio) continue
+            val sample = samples[target] ?: continue
             if (!sample.running) continue
 
             managedPssTotalKb += sample.totalPssKb
-            // Respect a minimum 60-second grace window so an app you just switched away from
-            // seconds ago (e.g. to reply to a message) is not insta-killed under mild pressure.
-            val lastFg = lastForegroundMs[pkg] ?: now
+            val lastFg = lastForegroundMs[target] ?: now
             if (now - lastFg >= MIN_PRESSURE_GRACE_MS) {
-                runningForceStop.add(pkg to sample)
+                runningForceStop.add(target to sample)
             }
         }
 
         val budgetKb = policy.managedBudgetMb * 1024L
         if (!lowAvailableRam && managedPssTotalKb <= budgetKb) return
 
-        // Evict least-recently-used FORCE_STOP apps one at a time until both budget & RAM recover
-        runningForceStop.sortBy { (pkg, _) -> lastForegroundMs[pkg] ?: 0L }
+        runningForceStop.sortBy { (target, _) -> lastForegroundMs[target] ?: 0L }
         var remainingKb = managedPssTotalKb
-        for ((pkg, sample) in runningForceStop) {
-            executeForceStop(pkg, sample.totalPssKb, CleanupTrigger.MEMORY_PRESSURE, now)
+        for ((target, sample) in runningForceStop) {
+            executeForceStop(target, sample.totalPssKb, CleanupTrigger.MEMORY_PRESSURE, now)
             remainingKb = (remainingKb - sample.totalPssKb).coerceAtLeast(0L)
             if (lowAvailableRam) {
                 val updatedMem = bridge.readMemoryOverview()
@@ -458,29 +553,28 @@ class PolicyEngine(
             if (!lowAvailableRam && remainingKb <= budgetKb) break
         }
 
-        // If RAM is still critically low, gently trim SOFT_TRIM apps without touching push daemons
         if (lowAvailableRam) {
             val cooldownMs = policy.backgroundTimeoutMinutes * 60_000L
-            for ((pkg, group) in targets) {
+            for ((target, group) in targets) {
                 if (group != AppGroup.SOFT_TRIM) continue
-                if (pkg == currentForegroundPkg) continue
-                if (policy.exemptActiveAudio && pkg in activeAudio) continue
-                val lastFg = lastForegroundMs[pkg] ?: now
+                if (target == currentForeground) continue
+                if (policy.exemptActiveAudio && target in activeAudio) continue
+                val lastFg = lastForegroundMs[target] ?: now
                 if (now - lastFg < MIN_PRESSURE_GRACE_MS) continue
-                val lastTrim = lastSoftTrimMs[pkg] ?: 0L
+                val lastTrim = lastSoftTrimMs[target] ?: 0L
                 if (now - lastTrim < cooldownMs) continue
-                val sample = samples[pkg] ?: continue
+                val sample = samples[target] ?: continue
                 if (sample.running) {
-                    executeSoftTrim(pkg, sample.totalPssKb, CleanupTrigger.MEMORY_PRESSURE, now)
+                    executeSoftTrim(target, sample.totalPssKb, CleanupTrigger.MEMORY_PRESSURE, now)
                 }
             }
         }
     }
 
-    private fun executeForceStop(pkg: String, beforePssKb: Long, trigger: CleanupTrigger, now: Long) {
-        if (bridge.forceStop(pkg, userId = 0)) {
-            recordEvent(
-                packageName = pkg,
+    private fun executeForceStop(target: AppTarget, beforePssKb: Long, trigger: CleanupTrigger, now: Long) {
+        if (bridge.forceStop(target.packageName, userId = target.userId)) {
+            recordTargetEvent(
+                target = target,
                 action = CleanupAction.FORCE_STOP,
                 trigger = trigger,
                 freedKb = beforePssKb.coerceAtLeast(0L),
@@ -489,13 +583,13 @@ class PolicyEngine(
         }
     }
 
-    private fun executeSoftTrim(pkg: String, beforePssKb: Long, trigger: CleanupTrigger, now: Long) {
-        if (bridge.softTrim(pkg, userId = 0)) {
-            lastSoftTrimMs[pkg] = now
-            val after = bridge.samplePackage(pkg, userId = 0)
+    private fun executeSoftTrim(target: AppTarget, beforePssKb: Long, trigger: CleanupTrigger, now: Long) {
+        if (bridge.softTrim(target.packageName, userId = target.userId)) {
+            lastSoftTrimMs[target] = now
+            val after = bridge.samplePackage(target.packageName, userId = target.userId)
             val freed = (beforePssKb - after.totalPssKb).coerceAtLeast(0L)
-            recordEvent(
-                packageName = pkg,
+            recordTargetEvent(
+                target = target,
                 action = CleanupAction.SOFT_TRIM,
                 trigger = trigger,
                 freedKb = freed,
@@ -506,6 +600,26 @@ class PolicyEngine(
 
     private fun groupToAction(group: AppGroup): CleanupAction =
         if (group == AppGroup.SOFT_TRIM) CleanupAction.SOFT_TRIM else CleanupAction.FORCE_STOP
+
+    private fun recordTargetEvent(
+        target: AppTarget,
+        action: CleanupAction,
+        trigger: CleanupTrigger,
+        freedKb: Long,
+        skippedReason: String? = null,
+        timestampMs: Long = bridge.nowMs(),
+    ) {
+        val defaultLabel = if (target.isDualSpace) "${target.packageName} (双开)" else target.packageName
+        recordEvent(
+            packageName = target.key,
+            appLabel = defaultLabel,
+            action = action,
+            trigger = trigger,
+            freedKb = freedKb,
+            skippedReason = skippedReason,
+            timestampMs = timestampMs,
+        )
+    }
 
     private fun recordEvent(
         packageName: String,

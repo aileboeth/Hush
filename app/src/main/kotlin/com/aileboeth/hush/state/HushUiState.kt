@@ -4,6 +4,7 @@ import com.aileboeth.hush.contract.AppGroup
 import com.aileboeth.hush.contract.BootstrapState
 import com.aileboeth.hush.contract.CleanupAction
 import com.aileboeth.hush.contract.CleanupEvent
+import com.aileboeth.hush.contract.CustomAppGroup
 import com.aileboeth.hush.contract.DaemonStatus
 import com.aileboeth.hush.contract.DiagnosticLogEntry
 import com.aileboeth.hush.contract.ManagedAppInfo
@@ -45,6 +46,14 @@ enum class ActivityFilterMode(val label: String) {
     SKIPPED("已跳过"),
 }
 
+sealed interface GroupEditorTarget {
+    data class BuiltInTier(val tier: AppGroup) : GroupEditorTarget
+    data class Custom(
+        val existing: CustomAppGroup? = null,
+        val preselectedAppKeys: Set<String> = emptySet(),
+    ) : GroupEditorTarget
+}
+
 data class MemorySamplePoint(
     val timestampMs: Long,
     val availableMb: Float,
@@ -66,6 +75,7 @@ data class HushUiState(
     val memoryHistory: List<MemorySamplePoint> = emptyList(),
     val managedApps: List<ManagedAppInfo> = emptyList(),
     val secondaryUsers: List<SecondaryUserInfo> = emptyList(),
+    val customGroups: List<CustomAppGroup> = emptyList(),
     val policyConfig: PolicyConfig = PolicyConfig(),
     val cleanupLogs: List<CleanupEvent> = emptyList(),
     val bootstrapState: BootstrapState = BootstrapState.Idle,
@@ -76,9 +86,11 @@ data class HushUiState(
     val isGlobalActionBusy: Boolean = false,
     // Apps screen state
     val appFilter: AppFilterMode = AppFilterMode.ALL,
+    val selectedCustomGroupId: String? = null,
     val appSort: AppSortMode = AppSortMode.MEMORY_DESC,
     val appSearchQuery: String = "",
-    val selectedAppPackage: String? = null,
+    val selectedAppKey: String? = null,
+    val groupEditorTarget: GroupEditorTarget? = null,
     // Activity bottom sheet filter
     val activityFilter: ActivityFilterMode = ActivityFilterMode.ALL,
     // Self-updater, disclaimer & diagnostic logs state
@@ -89,11 +101,21 @@ data class HushUiState(
     val isDiagnosticsLoading: Boolean = false,
     val diagnosticLogs: List<DiagnosticLogEntry> = emptyList(),
 ) {
+    /** Only true full secondary Android users (never clone/Xspace dual-app spaces or Work Profiles). */
+    val fullSecondaryUsers: List<SecondaryUserInfo>
+        get() = secondaryUsers.filter { it.isFullSecondarySystem }
+
     val selectedApp: ManagedAppInfo?
-        get() = selectedAppPackage?.let { pkg -> managedApps.firstOrNull { it.packageName == pkg } }
+        get() = selectedAppKey?.let { key -> managedApps.firstOrNull { it.appKey == key } }
+
+    val selectedCustomGroup: CustomAppGroup?
+        get() = selectedCustomGroupId?.let { id -> customGroups.firstOrNull { it.id == id } }
 
     val runningAppCount: Int
         get() = managedApps.count { it.running }
+
+    val dualSpaceAppCount: Int
+        get() = managedApps.count { it.isDualSpace }
 
     val restrictedAppCount: Int
         get() = managedApps.count { it.restriction.hasAnyRestriction }
@@ -101,35 +123,57 @@ data class HushUiState(
     val tierCounts: Map<AppGroup, Int>
         get() = managedApps.groupingBy { it.group }.eachCount()
 
+    fun customGroupsFor(appKey: String): List<CustomAppGroup> =
+        customGroups.filter { appKey in it.appKeys }
+
+    fun appsInCustomGroup(group: CustomAppGroup): List<ManagedAppInfo> {
+        val keySet = group.appKeys.toHashSet()
+        return managedApps.filter { it.appKey in keySet }
+    }
+
+    fun appsInTier(tier: AppGroup): List<ManagedAppInfo> =
+        managedApps.filter { it.group == tier }
+
     val filteredApps: List<ManagedAppInfo>
         get() {
             val q = appSearchQuery.trim().lowercase()
+            val activeCustom = selectedCustomGroup
+            val customKeySet = activeCustom?.appKeys?.toHashSet()
             val filtered = managedApps.filter { app ->
-                val matchesFilter = when (appFilter) {
-                    AppFilterMode.ALL -> true
-                    AppFilterMode.RUNNING -> app.running || app.totalPssKb > 0L
-                    AppFilterMode.FORCE_STOP -> app.group == AppGroup.FORCE_STOP
-                    AppFilterMode.SOFT_TRIM -> app.group == AppGroup.SOFT_TRIM
-                    AppFilterMode.PROTECTED -> app.group == AppGroup.PROTECTED
+                val matchesFilter = if (customKeySet != null) {
+                    app.appKey in customKeySet
+                } else {
+                    when (appFilter) {
+                        AppFilterMode.ALL -> true
+                        AppFilterMode.RUNNING -> app.running || app.totalPssKb > 0L
+                        AppFilterMode.FORCE_STOP -> app.group == AppGroup.FORCE_STOP
+                        AppFilterMode.SOFT_TRIM -> app.group == AppGroup.SOFT_TRIM
+                        AppFilterMode.PROTECTED -> app.group == AppGroup.PROTECTED
+                    }
                 }
                 val matchesQuery = q.isEmpty() ||
                     app.label.lowercase().contains(q) ||
-                    app.packageName.lowercase().contains(q)
+                    app.packageName.lowercase().contains(q) ||
+                    (app.isDualSpace && ("双开".contains(q) || "分身".contains(q) || "xspace".contains(q)))
                 matchesFilter && matchesQuery
             }
             return when (appSort) {
                 AppSortMode.MEMORY_DESC -> filtered.sortedWith(
                     compareByDescending<ManagedAppInfo> { it.totalPssKb }
                         .thenByDescending { it.running }
-                        .thenBy { it.label.lowercase() },
+                        .thenBy { it.label.lowercase() }
+                        .thenBy { it.userId },
                 )
                 AppSortMode.RUNNING_FIRST -> filtered.sortedWith(
                     compareByDescending<ManagedAppInfo> { it.running }
                         .thenByDescending { it.isPlayingAudio }
                         .thenByDescending { it.totalPssKb }
-                        .thenBy { it.label.lowercase() },
+                        .thenBy { it.label.lowercase() }
+                        .thenBy { it.userId },
                 )
-                AppSortMode.NAME_ASC -> filtered.sortedBy { it.label.lowercase() }
+                AppSortMode.NAME_ASC -> filtered.sortedWith(
+                    compareBy<ManagedAppInfo> { it.label.lowercase() }.thenBy { it.userId },
+                )
             }
         }
 

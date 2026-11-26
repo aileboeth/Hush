@@ -2,6 +2,7 @@ package com.aileboeth.hush.daemon
 
 import com.aileboeth.hush.contract.AppRestriction
 import com.aileboeth.hush.contract.AppRuntimeSample
+import com.aileboeth.hush.contract.AppTarget
 import com.aileboeth.hush.contract.HushLog
 import com.aileboeth.hush.contract.MemoryOverview
 import com.aileboeth.hush.contract.SafetyGuardrails
@@ -69,9 +70,11 @@ class AndroidSystemBridge : SystemBridge {
         )
     }
 
-    override fun getForegroundPackage(): String? {
+    override fun getForegroundPackage(): String? = getForegroundTarget()?.packageName
+
+    override fun getForegroundTarget(): AppTarget? {
         val out = execCommand(listOf("dumpsys", "activity", "activities"), timeoutMs = 4000)
-        return parseForegroundPackage(out)
+        return parseForegroundTarget(out)
     }
 
     override fun isScreenAwake(): Boolean {
@@ -79,26 +82,44 @@ class AndroidSystemBridge : SystemBridge {
         return parseScreenAwake(out)
     }
 
-    override fun getActiveAudioPackages(): Set<String> {
+    override fun getActiveAudioPackages(): Set<String> =
+        getActiveAudioTargets().mapTo(LinkedHashSet()) { it.packageName }
+
+    override fun getActiveAudioTargets(): Set<AppTarget> {
         refreshUidCacheIfNeeded()
         val audioOut = execCommand(listOf("dumpsys", "audio"), timeoutMs = 4000)
         val mediaOut = execCommand(listOf("dumpsys", "media_session"), timeoutMs = 4000)
 
-        val audioTrackPkgs = parseStartedAudibleUids(audioOut).mapNotNull { uidToPkgCache[it] }.toSet()
+        val audioTargets = parseStartedAudibleUids(audioOut).mapNotNull { fullUid ->
+            val userId = fullUid / PER_USER_RANGE
+            val appId = fullUid % PER_USER_RANGE
+            val pkg = uidToPkgCache[fullUid] ?: uidToPkgCache[appId] ?: return@mapNotNull null
+            AppTarget(pkg, userId)
+        }.toSet()
         val playingSessionPkgs = parsePlayingMediaSessions(mediaOut)
 
-        val candidates = playingSessionPkgs.intersect(audioTrackPkgs).ifEmpty {
-            playingSessionPkgs + audioTrackPkgs
+        val candidates = LinkedHashSet<AppTarget>()
+        if (playingSessionPkgs.isNotEmpty() && audioTargets.isNotEmpty()) {
+            val matched = audioTargets.filter { it.packageName in playingSessionPkgs }
+            if (matched.isNotEmpty()) {
+                candidates.addAll(matched)
+            } else {
+                candidates.addAll(audioTargets)
+                playingSessionPkgs.forEach { candidates.add(AppTarget(it, 0)) }
+            }
+        } else {
+            candidates.addAll(audioTargets)
+            playingSessionPkgs.forEach { candidates.add(AppTarget(it, 0)) }
         }
         if (candidates.isEmpty()) return emptySet()
 
         val awake = isScreenAwake()
-        val activeNonFrozen = LinkedHashSet<String>()
-        for (pkg in candidates) {
-            val sample = samplePackageMemOnly(pkg)
+        val activeNonFrozen = LinkedHashSet<AppTarget>()
+        for (target in candidates) {
+            val sample = samplePackageMemOnly(target.packageName, target.userId)
             if (sample.running && !sample.isFrozen) {
-                if (pkg in playingSessionPkgs || awake) {
-                    activeNonFrozen.add(pkg)
+                if (target.packageName in playingSessionPkgs || awake) {
+                    activeNonFrozen.add(target)
                 }
             }
         }
@@ -118,6 +139,38 @@ class AndroidSystemBridge : SystemBridge {
         return result
     }
 
+    override fun listClonePackages(): List<AppTarget> {
+        val rawUsers = parsePmListUsers(execCommand(listOf("pm", "list", "users"), timeoutMs = 4_000))
+        val cloneUserIds = rawUsers.filter { u ->
+            if (u.userId <= 0) return@filter false
+            val isManaged = (u.flags and FLAG_MANAGED_PROFILE) != 0
+            isCloneUser(u.userId, u.name, u.flags, isManaged)
+        }.map { it.userId }
+        if (cloneUserIds.isEmpty()) return emptyList()
+
+        val targets = LinkedHashSet<AppTarget>()
+        val runningByCloneUser = parsePsPackagesByUser(
+            execCommand(listOf("ps", "-A", "-o", "USER,NAME"), timeoutMs = 4_000),
+            targetUsers = cloneUserIds.toSet(),
+        )
+        for (uid in cloneUserIds) {
+            val thirdParty = parsePmPackageLines(
+                execCommand(listOf("pm", "list", "packages", "-3", "--user", uid.toString()), timeoutMs = 5_000),
+            )
+            for (pkg in thirdParty) {
+                if (pkg != SafetyGuardrails.SELF_PACKAGE && !SafetyGuardrails.isSystemProtected(pkg)) {
+                    targets.add(AppTarget(pkg, uid))
+                }
+            }
+            for (pkg in runningByCloneUser[uid].orEmpty()) {
+                if (pkg != SafetyGuardrails.SELF_PACKAGE && !SafetyGuardrails.isSystemProtected(pkg)) {
+                    targets.add(AppTarget(pkg, uid))
+                }
+            }
+        }
+        return targets.toList()
+    }
+
     override fun samplePackage(packageName: String, userId: Int): AppRuntimeSample {
         val base = samplePackageMemOnly(packageName, userId)
         val (restriction, bucket) = readRestriction(packageName, userId)
@@ -128,57 +181,66 @@ class AndroidSystemBridge : SystemBridge {
     }
 
     override fun samplePackagesBatch(packages: List<String>, userId: Int): Map<String, AppRuntimeSample> {
-        // 1. Single device-wide `dumpsys meminfo -S` + `ps` PID->userId map gives exact PSS + Swap PSS
-        //    even on ROMs (e.g. OriginOS) that omit `(user 10)` tags in `dumpsys meminfo -S`.
-        val memOut = execCommand(listOf("dumpsys", "meminfo", "-S"), timeoutMs = 15_000)
-        val pidToUser = parsePsPidUsers(execCommand(listOf("ps", "-A", "-o", "USER,PID"), timeoutMs = 4_000))
-        val memByPkg = parseBatchMeminfo(memOut, targetUserId = userId, pidToUserId = pidToUser)
-
-        // 2. Single O(1) queries for appops restrictions, standby buckets & disabled packages
-        val bgRestricted = queryRestrictedAppOps("RUN_ANY_IN_BACKGROUND", userId)
-        val wlRestricted = queryRestrictedAppOps("WAKE_LOCK", userId)
-        val buckets = queryAllStandbyBuckets(userId)
-        val disabledPkgs = queryDisabledPackages(userId)
-
-        // 3. Single O(1) query for frozen packages via `dumpsys activity processes`
-        //    (On OriginOS, `dumpsys activity processes` exposes both AOSP `isFrozen=true` and
-        //    vivo QuickFrozen's standalone `isFrozen=true` line under each ProcessRecord.)
-        val procOut = execCommand(listOf("dumpsys", "activity", "processes"), timeoutMs = 6_000)
-        val frozenPkgs = parseFrozenPackagesFromProcesses(procOut, targetUserId = userId)
-
+        val targets = packages.distinct().map { AppTarget(it, userId) }
+        val batch = sampleTargetsBatch(targets)
         val result = LinkedHashMap<String, AppRuntimeSample>(packages.size)
         for (pkg in packages) {
-            val agg = memByPkg[pkg]
-            val bucket = buckets[pkg] ?: StandbyBucket.UNKNOWN
-            val restriction = AppRestriction(
-                restrictBackground = pkg in bgRestricted,
-                restrictWakeLock = pkg in wlRestricted,
-                restrictedBucket = bucket == StandbyBucket.RESTRICTED,
-                disableApp = pkg in disabledPkgs,
-            )
-            result[pkg] = AppRuntimeSample(
-                packageName = pkg,
-                userId = userId,
-                running = agg != null && agg.processCount > 0,
-                isFrozen = pkg in frozenPkgs,
-                totalPssKb = agg?.totalPssKb ?: 0L,
-                swapPssKb = agg?.swapPssKb ?: 0L,
-                processCount = agg?.processCount ?: 0,
-                restriction = restriction,
-                standbyBucket = bucket,
-            )
+            result[pkg] = batch[AppTarget(pkg, userId)] ?: AppRuntimeSample(packageName = pkg, userId = userId)
+        }
+        return result
+    }
+
+    override fun sampleTargetsBatch(targets: List<AppTarget>): Map<AppTarget, AppRuntimeSample> {
+        if (targets.isEmpty()) return emptyMap()
+        // 1. Single device-wide `dumpsys meminfo -S`, `ps`, and `dumpsys activity processes` shared across all users
+        val memOut = execCommand(listOf("dumpsys", "meminfo", "-S"), timeoutMs = 15_000)
+        val pidToUser = parsePsPidUsers(execCommand(listOf("ps", "-A", "-o", "USER,PID"), timeoutMs = 4_000))
+        val procOut = execCommand(listOf("dumpsys", "activity", "processes"), timeoutMs = 6_000)
+
+        val result = LinkedHashMap<AppTarget, AppRuntimeSample>(targets.size)
+        for ((uid, group) in targets.groupBy { it.userId }) {
+            val memByPkg = parseBatchMeminfo(memOut, targetUserId = uid, pidToUserId = pidToUser)
+            val bgRestricted = queryRestrictedAppOps("RUN_ANY_IN_BACKGROUND", uid)
+            val wlRestricted = queryRestrictedAppOps("WAKE_LOCK", uid)
+            val buckets = queryAllStandbyBuckets(uid)
+            val disabledPkgs = queryDisabledPackages(uid)
+            val frozenPkgs = parseFrozenPackagesFromProcesses(procOut, targetUserId = uid)
+
+            for (target in group) {
+                val pkg = target.packageName
+                val agg = memByPkg[pkg]
+                val bucket = buckets[pkg] ?: StandbyBucket.UNKNOWN
+                val restriction = AppRestriction(
+                    restrictBackground = pkg in bgRestricted,
+                    restrictWakeLock = pkg in wlRestricted,
+                    restrictedBucket = bucket == StandbyBucket.RESTRICTED,
+                    disableApp = pkg in disabledPkgs,
+                )
+                result[target] = AppRuntimeSample(
+                    packageName = pkg,
+                    userId = uid,
+                    running = agg != null && agg.processCount > 0,
+                    isFrozen = pkg in frozenPkgs,
+                    totalPssKb = agg?.totalPssKb ?: 0L,
+                    swapPssKb = agg?.swapPssKb ?: 0L,
+                    processCount = agg?.processCount ?: 0,
+                    restriction = restriction,
+                    standbyBucket = bucket,
+                )
+            }
         }
         return result
     }
 
     private fun samplePackageMemOnly(packageName: String, userId: Int = 0): AppRuntimeSample {
-        // IMPORTANT: AOSP `dumpsys meminfo` does NOT support `--user`.
-        // `-S` includes Swap PSS, `-s` prints compact summary, `--package` matches main + all sub-processes.
+        // IMPORTANT: AOSP `dumpsys meminfo` does NOT support `--user`, so it outputs blocks for
+        // BOTH user 0 and clone users (e.g. user 999). Join each block's PID against `ps` to isolate [userId].
         val out = execCommand(
             listOf("dumpsys", "meminfo", "-S", "-s", "--package", packageName),
             timeoutMs = 5_000,
         )
-        return parseMeminfoSummary(packageName, userId, out)
+        val pidToUser = parsePsPidUsers(execCommand(listOf("ps", "-A", "-o", "USER,PID"), timeoutMs = 3_000))
+        return parseMeminfoSummary(packageName, userId, out, pidToUserId = pidToUser)
     }
 
     private fun queryRestrictedAppOps(op: String, userId: Int): Set<String> {
@@ -221,7 +283,7 @@ class AndroidSystemBridge : SystemBridge {
         // (such as `:appbrand*`, `:tools*`, `:sandboxed_process*`), strictly skipping `:push` / `:msf`.
         // We intentionally do NOT call package-wide `am kill`, because `am kill` kills SERVICE_ADJ
         // processes and could terminate WeChat/QQ's `:push` daemon.
-        val procs = listPackageProcesses(packageName)
+        val procs = listPackageProcesses(packageName, userId)
         var anyTrimmed = false
         for (proc in procs) {
             if (isPushProcess(proc)) continue
@@ -352,8 +414,7 @@ class AndroidSystemBridge : SystemBridge {
         return rawUsers.map { u ->
             val memAgg = memTotals[u.userId]
             val isManaged = (u.flags and FLAG_MANAGED_PROFILE) != 0
-            val isClone = u.userId == 999 ||
-                ((u.flags and FLAG_PROFILE) != 0 && !isManaged && (u.flags and FLAG_FULL) == 0)
+            val isClone = isCloneUser(u.userId, u.name, u.flags, isManaged)
             val procs = maxOf(memAgg?.processCount ?: 0, psProcCounts[u.userId] ?: 0)
             SecondaryUserInfo(
                 userId = u.userId,
@@ -388,11 +449,17 @@ class AndroidSystemBridge : SystemBridge {
         return code == 0
     }
 
-    private fun listPackageProcesses(packageName: String): List<String> {
-        val out = execCommand(listOf("ps", "-A", "-o", "NAME"), timeoutMs = 3_000)
+    private fun listPackageProcesses(packageName: String, userId: Int): List<String> {
+        val out = execCommand(listOf("ps", "-A", "-o", "USER,NAME"), timeoutMs = 3_000)
         val result = LinkedHashSet<String>()
         for (line in out.lineSequence()) {
-            val name = line.trim()
+            val trimmed = line.trim()
+            if (trimmed.isEmpty() || trimmed.startsWith("USER")) continue
+            val parts = trimmed.split(Regex("\\s+"))
+            if (parts.size < 2) continue
+            val procUser = extractPsUserId(parts[0]) ?: continue
+            if (procUser != userId) continue
+            val name = parts[1]
             if (name == packageName || name.startsWith("$packageName:")) {
                 result.add(name)
             }
@@ -462,14 +529,17 @@ class AndroidSystemBridge : SystemBridge {
         private const val FLAG_MANAGED_PROFILE = 0x20
         private const val FLAG_FULL = 0x400
         private const val FLAG_PROFILE = 0x1000
+        private const val PER_USER_RANGE = 100_000
 
         private val PM_USER_LINE_REGEX = Regex("""UserInfo\{(\d+):([^:]*):([0-9a-fA-F]+)\}(?:\s+(running))?""")
         private val PS_USER_PREFIX_REGEX = Regex("""^u(\d+)_""")
         private val UID_PKG_REGEX = Regex("""^package:(\S+)\s+uid:(\d+)""")
+        private val RESUMED_ACTIVITY_TARGET_REGEX = Regex("""(?:topResumedActivity|mResumedActivity|ResumedActivity)[=:][^\n]*?\bu(\d+)\s+([a-zA-Z0-9_.]+)/""")
         private val RESUMED_ACTIVITY_REGEX = Regex("""(?:topResumedActivity|mResumedActivity|ResumedActivity)[=:][^\n]*?\s+([a-zA-Z0-9_.]+)/""")
         private val TOTAL_PSS_REGEX = Regex("""TOTAL PSS:\s+(\d+)""")
         private val TOTAL_SWAP_PSS_REGEX = Regex("""TOTAL SWAP PSS:\s+(\d+)""")
         private val MEMINFO_PID_REGEX = Regex("""\*\* MEMINFO in pid (\d+) \[([^\]]+)\] \*\*""")
+        private val BLOCK_PID_PREFIX_REGEX = Regex("""^(\d+)\s+\[([^\]]+)\]""")
         private val AUDIO_PLAYER_REGEX = Regex("""AudioPlaybackConfiguration[^\n]*?u/pid:(\d+)/(\d+)[^\n]*?state:(\w+)[^\n]*?mutedState:(\w+)""")
         private val MEDIA_SESSION_PKG_REGEX = Regex("""^\s*package=([a-zA-Z0-9_.]+)""")
         private val MEDIA_PLAYBACK_STATE_REGEX = Regex("""state=PlaybackState\s*\{state=(\w+|3)\b""")
@@ -482,6 +552,46 @@ class AndroidSystemBridge : SystemBridge {
         private val USER_IN_LINE_REGEX = Regex("""\(user (\d+)\)""")
         private val STANDBY_LINE_REGEX = Regex("""^\s*([a-zA-Z0-9_.]+)\s*[:=]\s*(\d+)""")
         private val PROC_RECORD_REGEX = Regex("""\b\d+:([a-zA-Z0-9_.:-]+)/u(\d+)a\d+\b""")
+
+        internal fun isCloneUser(userId: Int, name: String, flags: Int, isManaged: Boolean): Boolean {
+            if (userId <= 0 || isManaged) return false
+            if (userId == 999) return true
+            if ((flags and FLAG_PROFILE) != 0 && (flags and FLAG_FULL) == 0) return true
+            val lower = name.trim().lowercase()
+            return lower.contains("xspace") ||
+                lower.contains("multiapp") ||
+                lower.contains("multi_app") ||
+                lower.contains("dualapp") ||
+                lower.contains("dual_app") ||
+                lower.contains("parallel") ||
+                lower.contains("clone") ||
+                lower.contains("应用双开") ||
+                lower.contains("应用分身")
+        }
+
+        internal fun extractPsUserId(psUserColumn: String): Int? =
+            PS_USER_PREFIX_REGEX.find(psUserColumn)?.groupValues?.get(1)?.toIntOrNull()
+
+        internal fun parsePsPackagesByUser(
+            output: String,
+            targetUsers: Set<Int>,
+        ): Map<Int, Set<String>> {
+            if (targetUsers.isEmpty()) return emptyMap()
+            val result = HashMap<Int, MutableSet<String>>()
+            for (line in output.lineSequence()) {
+                val trimmed = line.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("USER")) continue
+                val parts = trimmed.split(Regex("\\s+"))
+                if (parts.size < 2) continue
+                val uid = extractPsUserId(parts[0]) ?: continue
+                if (uid !in targetUsers) continue
+                val basePkg = parts[1].substringBefore(':')
+                if (basePkg.contains('.') && !basePkg.startsWith("[")) {
+                    result.getOrPut(uid) { LinkedHashSet() }.add(basePkg)
+                }
+            }
+            return result
+        }
 
         internal fun isPushProcess(processName: String): Boolean {
             val lower = processName.lowercase()
@@ -694,11 +804,19 @@ class AndroidSystemBridge : SystemBridge {
             return map
         }
 
-        internal fun parseForegroundPackage(dumpsysActivitiesOutput: String): String? {
+        internal fun parseForegroundPackage(dumpsysActivitiesOutput: String): String? =
+            parseForegroundTarget(dumpsysActivitiesOutput)?.packageName
+
+        internal fun parseForegroundTarget(dumpsysActivitiesOutput: String): AppTarget? {
             for (line in dumpsysActivitiesOutput.lineSequence()) {
                 if (!line.contains("ResumedActivity")) continue
+                val um = RESUMED_ACTIVITY_TARGET_REGEX.find(line)
+                if (um != null) {
+                    val uid = um.groupValues[1].toIntOrNull() ?: 0
+                    return AppTarget(um.groupValues[2], uid)
+                }
                 val m = RESUMED_ACTIVITY_REGEX.find(line)
-                if (m != null) return m.groupValues[1]
+                if (m != null) return AppTarget(m.groupValues[1], 0)
             }
             return null
         }
@@ -747,7 +865,12 @@ class AndroidSystemBridge : SystemBridge {
             return playing
         }
 
-        internal fun parseMeminfoSummary(packageName: String, userId: Int, output: String): AppRuntimeSample {
+        internal fun parseMeminfoSummary(
+            packageName: String,
+            userId: Int,
+            output: String,
+            pidToUserId: Map<Int, Int> = emptyMap(),
+        ): AppRuntimeSample {
             if (output.contains("No process found for:")) {
                 return AppRuntimeSample(packageName = packageName, userId = userId, running = false)
             }
@@ -776,6 +899,13 @@ class AndroidSystemBridge : SystemBridge {
 
             for (i in 1 until blocks.size) {
                 val block = blocks[i]
+                if (pidToUserId.isNotEmpty()) {
+                    val pid = BLOCK_PID_PREFIX_REGEX.find(block)?.groupValues?.get(1)?.toIntOrNull()
+                    if (pid != null) {
+                        val blockUser = pidToUserId[pid] ?: 0
+                        if (blockUser != userId) continue
+                    }
+                }
                 processCount++
                 totalPss += TOTAL_PSS_REGEX.find(block)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
                 totalSwap += TOTAL_SWAP_PSS_REGEX.find(block)?.groupValues?.get(1)?.toLongOrNull() ?: 0L

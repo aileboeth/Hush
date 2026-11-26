@@ -22,7 +22,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -50,17 +52,19 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.aileboeth.hush.AppleConfirmDialog
 import com.aileboeth.hush.contract.AppGroup
+import com.aileboeth.hush.contract.AppTarget
+import com.aileboeth.hush.contract.CustomAppGroup
 import com.aileboeth.hush.contract.DaemonStatus
 import com.aileboeth.hush.contract.ManagedAppInfo
 import com.aileboeth.hush.design.AppIconAvatar
 import com.aileboeth.hush.design.AppleGroupedCard
+import com.aileboeth.hush.design.ApplePillButton
 import com.aileboeth.hush.design.HushIcons
 import com.aileboeth.hush.design.HushTheme
 import com.aileboeth.hush.design.HushType
 import com.aileboeth.hush.design.StaggerClock
 import com.aileboeth.hush.design.applePressScale
 import com.aileboeth.hush.design.formatMemoryKb
-import com.aileboeth.hush.design.rememberStaggerClock
 import com.aileboeth.hush.design.staggeredCascade
 import com.aileboeth.hush.design.tierAccentColor
 import com.aileboeth.hush.design.tierShortLabel
@@ -76,19 +80,48 @@ fun AppsScreen(
     animatedVisibilityScope: AnimatedVisibilityScope,
     onRefresh: () -> Unit,
     onFilterChange: (AppFilterMode) -> Unit,
+    onSelectCustomGroup: (String?) -> Unit,
     onSortChange: (AppSortMode) -> Unit,
     onSearchChange: (String) -> Unit,
     onSelectApp: (String) -> Unit,
+    onOpenBuiltInGroupEditor: (AppGroup) -> Unit,
+    onOpenCustomGroupEditor: (CustomAppGroup?) -> Unit,
+    onExecuteGroupAction: (String, AppGroup, List<AppTarget>) -> Unit,
     onRestoreAllRestrictions: () -> Unit = {},
+    listState: LazyListState = rememberLazyListState(),
     modifier: Modifier = Modifier,
 ) {
     val c = HushTheme.colors
     val apps = uiState.filteredApps
     val isRunning = uiState.daemonStatus is DaemonStatus.Running
-    val stagger = rememberStaggerClock(uiState.appFilter, uiState.appSort)
+    val activeCustomGroup = uiState.selectedCustomGroup
+    val stagger = remember(uiState.appFilter, uiState.selectedCustomGroupId, uiState.appSort) {
+        StaggerClock(windowMs = if (listState.firstVisibleItemIndex == 0) 900L else 0L)
+    }
     val refreshState = rememberPullToRefreshState()
     val statusTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     var showRestoreDialog by remember { mutableStateOf(false) }
+
+    // Determine whether the active filter corresponds to an actionable group (custom or built-in tier)
+    val activeGroupTier: AppGroup? = when {
+        activeCustomGroup != null -> activeCustomGroup.action
+        uiState.appFilter == AppFilterMode.FORCE_STOP -> AppGroup.FORCE_STOP
+        uiState.appFilter == AppFilterMode.SOFT_TRIM -> AppGroup.SOFT_TRIM
+        uiState.appFilter == AppFilterMode.PROTECTED -> AppGroup.PROTECTED
+        else -> null
+    }
+    val activeGroupTitle: String? = when {
+        activeCustomGroup != null -> activeCustomGroup.name
+        uiState.appFilter == AppFilterMode.FORCE_STOP -> "强杀组"
+        uiState.appFilter == AppFilterMode.SOFT_TRIM -> "保消息瘦身组"
+        uiState.appFilter == AppFilterMode.PROTECTED -> "常驻保护组"
+        else -> null
+    }
+    val activeGroupMembers: List<ManagedAppInfo> = when {
+        activeCustomGroup != null -> uiState.appsInCustomGroup(activeCustomGroup)
+        activeGroupTier != null -> uiState.appsInTier(activeGroupTier)
+        else -> emptyList()
+    }
 
     PullToRefreshBox(
         isRefreshing = uiState.isRefreshing,
@@ -106,6 +139,7 @@ fun AppsScreen(
         modifier = modifier.fillMaxSize(),
     ) {
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(
                 start = 20.dp,
@@ -126,10 +160,11 @@ fun AppsScreen(
                         verticalAlignment = Alignment.Bottom,
                     ) {
                         Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                            val countCaption = if (uiState.appFilter == AppFilterMode.ALL && uiState.appSearchQuery.isBlank()) {
-                                "${uiState.managedApps.size} 个应用"
+                            val dualNote = if (uiState.dualSpaceAppCount > 0) " · 含 ${uiState.dualSpaceAppCount} 双开" else ""
+                            val countCaption = if (activeCustomGroup == null && uiState.appFilter == AppFilterMode.ALL && uiState.appSearchQuery.isBlank()) {
+                                "${uiState.managedApps.size} 个应用$dualNote"
                             } else {
-                                "显示 ${apps.size} / ${uiState.managedApps.size} 个应用"
+                                "显示 ${apps.size} / ${uiState.managedApps.size} 个应用$dualNote"
                             }
                             Text(
                                 text = countCaption,
@@ -214,7 +249,7 @@ fun AppsScreen(
                         )
                         Box(modifier = Modifier.weight(1f)) {
                             if (uiState.appSearchQuery.isEmpty()) {
-                                Text("搜索应用或包名", style = HushType.body, color = c.textTertiary)
+                                Text("搜索应用、包名或“双开”", style = HushType.body, color = c.textTertiary)
                             }
                             BasicTextField(
                                 value = uiState.appSearchQuery,
@@ -246,15 +281,16 @@ fun AppsScreen(
                         }
                     }
 
-                    // Compact horizontal filter strip with live counts
+                    // Compact horizontal filter & custom-group strip
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
                         AppFilterMode.entries.forEach { mode ->
-                            val selected = uiState.appFilter == mode
+                            val selected = activeCustomGroup == null && uiState.appFilter == mode
                             val count = when (mode) {
                                 AppFilterMode.ALL -> uiState.managedApps.size
                                 AppFilterMode.RUNNING -> uiState.managedApps.count { it.running || it.totalPssKb > 0L }
@@ -262,46 +298,91 @@ fun AppsScreen(
                                 AppFilterMode.SOFT_TRIM -> uiState.tierCounts[AppGroup.SOFT_TRIM] ?: 0
                                 AppFilterMode.PROTECTED -> uiState.tierCounts[AppGroup.PROTECTED] ?: 0
                             }
-                            Surface(
-                                modifier = Modifier
-                                    .applePressScale(cornerRadius = 100.dp) { onFilterChange(mode) },
-                                shape = RoundedCornerShape(100.dp),
-                                color = if (selected) c.blue else c.surface,
-                                border = if (!selected) {
-                                    BorderStroke(0.6.dp, if (c.isDark) c.glassBorder else c.separator)
-                                } else {
-                                    null
-                                },
-                                shadowElevation = if (!selected && !c.isDark) 0.5.dp else 0.dp,
+                            FilterChipPill(
+                                label = mode.label,
+                                count = count,
+                                selected = selected,
+                                dotColor = null,
+                                onClick = { onFilterChange(mode) },
+                            )
+                        }
+
+                        // User-defined custom groups right in the filter bar
+                        uiState.customGroups.forEach { group ->
+                            val selected = activeCustomGroup?.id == group.id
+                            val memberCount = uiState.appsInCustomGroup(group).size
+                            FilterChipPill(
+                                label = group.name,
+                                count = memberCount,
+                                selected = selected,
+                                dotColor = tierAccentColor(group.action),
+                                onClick = { onSelectCustomGroup(group.id) },
+                            )
+                        }
+
+                        // Create new custom group pill
+                        Surface(
+                            modifier = Modifier
+                                .applePressScale(cornerRadius = 100.dp) { onOpenCustomGroupEditor(null) },
+                            shape = RoundedCornerShape(100.dp),
+                            color = c.blueSoft,
+                            border = BorderStroke(0.6.dp, c.blue.copy(alpha = 0.25f)),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.5.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                ) {
-                                    Text(
-                                        text = mode.label,
-                                        style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
-                                        color = if (selected) c.onBlue else c.textPrimary,
-                                    )
-                                    Text(
-                                        text = count.toString(),
-                                        style = HushType.micro.copy(fontFeatureSettings = "tnum"),
-                                        color = if (selected) c.onBlue.copy(alpha = 0.84f) else c.textTertiary,
-                                    )
-                                }
+                                Icon(
+                                    imageVector = HushIcons.Plus,
+                                    contentDescription = "新建分组",
+                                    tint = c.blue,
+                                    modifier = Modifier.size(13.dp),
+                                )
+                                Text(
+                                    text = "新建组",
+                                    style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                                    color = c.blue,
+                                )
                             }
                         }
                     }
 
                     if (!isRunning && uiState.managedApps.isNotEmpty()) {
                         Text(
-                            text = "守护未运行 · 可先完成分档，激活后实时读取内存与后台操作",
+                            text = "守护未运行 · 可先完成分档与建组，激活后实时读取内存与批量清理",
                             style = HushType.micro,
                             color = c.textTertiary,
                             modifier = Modifier.padding(horizontal = 4.dp),
                         )
                     }
+                }
+            }
+
+            // Group Action Banner (one-tap batch force-stop / soft-trim + batch member editing!)
+            if (activeGroupTier != null && activeGroupTitle != null) {
+                item(key = "group_banner_${activeCustomGroup?.id ?: activeGroupTier.name}") {
+                    GroupActionBanner(
+                        title = activeGroupTitle,
+                        action = activeGroupTier,
+                        members = activeGroupMembers,
+                        isCustom = activeCustomGroup != null,
+                        isOnline = isRunning,
+                        isBusy = uiState.isGlobalActionBusy,
+                        onEditMembers = {
+                            if (activeCustomGroup != null) {
+                                onOpenCustomGroupEditor(activeCustomGroup)
+                            } else {
+                                onOpenBuiltInGroupEditor(activeGroupTier)
+                            }
+                        },
+                        onRunBatchAction = {
+                            val targets = activeGroupMembers
+                                .filter { !it.isSystemProtected }
+                                .map { AppTarget(it.packageName, it.userId) }
+                            onExecuteGroupAction(activeGroupTitle, activeGroupTier, targets)
+                        },
+                    )
                 }
             }
 
@@ -311,25 +392,42 @@ fun AppsScreen(
                         Column(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            Text("没有匹配的应用", style = HushType.cardTitle, color = c.textPrimary)
-                            Text("切换筛选条件或清空搜索词再试试", style = HushType.caption, color = c.textTertiary)
+                            Text(
+                                text = if (activeGroupTitle != null && uiState.appSearchQuery.isBlank()) {
+                                    "「$activeGroupTitle」还没有应用"
+                                } else {
+                                    "没有匹配的应用"
+                                },
+                                style = HushType.cardTitle,
+                                color = c.textPrimary,
+                            )
+                            Text(
+                                text = if (activeGroupTitle != null && uiState.appSearchQuery.isBlank()) {
+                                    "点击上方「管理成员」可一次勾选多个应用加入本组"
+                                } else {
+                                    "切换筛选条件或清空搜索词再试试"
+                                },
+                                style = HushType.caption,
+                                color = c.textTertiary,
+                            )
                         }
                     }
                 }
             } else {
                 itemsIndexed(
                     items = apps,
-                    key = { _, app -> "${app.packageName}:${app.userId}" },
+                    key = { _, app -> app.appKey },
                 ) { index, app ->
                     AppSharedElementRowCard(
                         app = app,
+                        customGroupNames = uiState.customGroupsFor(app.appKey).map { it.name },
                         index = index,
                         stagger = stagger,
                         sharedTransitionScope = sharedTransitionScope,
                         animatedVisibilityScope = animatedVisibilityScope,
-                        onClick = { onSelectApp(app.packageName) },
+                        onClick = { onSelectApp(app.appKey) },
                     )
                 }
             }
@@ -339,7 +437,7 @@ fun AppsScreen(
     if (showRestoreDialog) {
         AppleConfirmDialog(
             title = "还原全部后台限制？",
-            message = "将恢复 Hush 写入过的 ${uiState.restrictedAppCount} 个应用的 appops、待机桶修改，并自动重新启用已停用的应用，不影响应用档位配置。",
+            message = "将恢复 Hush 写入过的 ${uiState.restrictedAppCount} 个应用的 appops、待机桶修改，并自动重新启用已停用的应用，不影响应用档位与分组配置。",
             confirmText = "确认还原",
             destructive = false,
             onDismiss = { showRestoreDialog = false },
@@ -351,10 +449,150 @@ fun AppsScreen(
     }
 }
 
+@Composable
+private fun FilterChipPill(
+    label: String,
+    count: Int,
+    selected: Boolean,
+    dotColor: Color?,
+    onClick: () -> Unit,
+) {
+    val c = HushTheme.colors
+    Surface(
+        modifier = Modifier.applePressScale(cornerRadius = 100.dp, onClick = onClick),
+        shape = RoundedCornerShape(100.dp),
+        color = if (selected) c.blue else c.surface,
+        border = if (!selected) {
+            BorderStroke(0.6.dp, if (c.isDark) c.glassBorder else c.separator)
+        } else {
+            null
+        },
+        shadowElevation = if (!selected && !c.isDark) 0.5.dp else 0.dp,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            if (dotColor != null) {
+                Box(
+                    Modifier
+                        .size(6.dp)
+                        .clip(CircleShape)
+                        .background(if (selected) c.onBlue else dotColor),
+                )
+            }
+            Text(
+                text = label,
+                style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                color = if (selected) c.onBlue else c.textPrimary,
+                maxLines = 1,
+            )
+            Text(
+                text = count.toString(),
+                style = HushType.micro.copy(fontFeatureSettings = "tnum"),
+                color = if (selected) c.onBlue.copy(alpha = 0.84f) else c.textTertiary,
+            )
+        }
+    }
+}
+
+@Composable
+private fun GroupActionBanner(
+    title: String,
+    action: AppGroup,
+    members: List<ManagedAppInfo>,
+    isCustom: Boolean,
+    isOnline: Boolean,
+    isBusy: Boolean,
+    onEditMembers: () -> Unit,
+    onRunBatchAction: () -> Unit,
+) {
+    val c = HushTheme.colors
+    val accent = tierAccentColor(action)
+    val runningMembers = members.filter { it.running && !it.isSystemProtected }
+    val runningPssKb = runningMembers.sumOf { it.totalPssKb }
+
+    val summary = when {
+        members.isEmpty() -> "点击右侧批量勾选应用加入本组"
+        runningMembers.isEmpty() -> "共 ${members.size} 个应用 · 当前均未运行"
+        runningPssKb > 0L -> "共 ${members.size} 个 · ${runningMembers.size} 个运行中 (${formatMemoryKb(runningPssKb)})"
+        else -> "共 ${members.size} 个 · ${runningMembers.size} 个运行中"
+    }
+
+    AppleGroupedCard(contentPadding = PaddingValues(14.dp)) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Box(Modifier.size(8.dp).clip(CircleShape).background(accent))
+                    Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                        Text(
+                            text = title,
+                            style = HushType.cardTitle,
+                            color = c.textPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = summary,
+                            style = HushType.micro,
+                            color = c.textSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                ApplePillButton(
+                    text = if (isCustom) "编辑分组" else "管理成员",
+                    onClick = onEditMembers,
+                    containerColor = c.surfaceMuted,
+                    contentColor = c.textPrimary,
+                    height = 38.dp,
+                    modifier = Modifier.weight(1f),
+                )
+                if (action == AppGroup.FORCE_STOP || action == AppGroup.SOFT_TRIM) {
+                    val isKill = action == AppGroup.FORCE_STOP
+                    val verb = if (isKill) "一键强杀" else "一键瘦身"
+                    val btnText = when {
+                        isBusy -> "处理中…"
+                        runningMembers.isNotEmpty() -> "$verb (${runningMembers.size})"
+                        else -> "${verb}本组"
+                    }
+                    ApplePillButton(
+                        text = btnText,
+                        onClick = onRunBatchAction,
+                        enabled = isOnline && !isBusy && runningMembers.isNotEmpty(),
+                        containerColor = if (isKill) c.redSoft else c.blueSoft,
+                        contentColor = if (isKill) c.red else c.blue,
+                        icon = if (isKill) HushIcons.Bolt else HushIcons.Feather,
+                        height = 38.dp,
+                        modifier = Modifier.weight(1.25f),
+                    )
+                }
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalSharedTransitionApi::class)
 @Composable
 private fun AppSharedElementRowCard(
     app: ManagedAppInfo,
+    customGroupNames: List<String>,
     index: Int,
     stagger: StaggerClock,
     sharedTransitionScope: SharedTransitionScope,
@@ -372,7 +610,7 @@ private fun AppSharedElementRowCard(
                 .fillMaxWidth()
                 .staggeredCascade(index, stagger)
                 .sharedBounds(
-                    sharedContentState = rememberSharedContentState(key = "app_card_${app.packageName}"),
+                    sharedContentState = rememberSharedContentState(key = "app_card_${app.appKey}"),
                     animatedVisibilityScope = animatedVisibilityScope,
                     boundsTransform = { _, _ -> spring(dampingRatio = 0.80f, stiffness = 360f) },
                     clipInOverlayDuringTransition = OverlayClip(shape),
@@ -395,7 +633,7 @@ private fun AppSharedElementRowCard(
                     label = app.label,
                     size = 42.dp,
                     modifier = Modifier.sharedElement(
-                        state = rememberSharedContentState(key = "app_icon_${app.packageName}"),
+                        state = rememberSharedContentState(key = "app_icon_${app.appKey}"),
                         animatedVisibilityScope = animatedVisibilityScope,
                     ),
                 )
@@ -404,25 +642,54 @@ private fun AppSharedElementRowCard(
                     modifier = Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
-                    Text(
-                        text = app.label,
-                        style = HushType.cardTitle,
-                        color = c.textPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.sharedElement(
-                            state = rememberSharedContentState(key = "app_title_${app.packageName}"),
-                            animatedVisibilityScope = animatedVisibilityScope,
-                        ),
-                    )
-                    // Pure memory/runtime line (no extra status words crammed in, preventing truncation!)
-                    val memoryLine = when {
-                        app.restriction.disableApp -> "已停用 · 系统无法拉起"
-                        app.totalPssKb > 0L && app.swapPssKb > 0L ->
-                            "${formatMemoryKb(app.totalPssKb)} · Swap ${formatMemoryKb(app.swapPssKb)}"
-                        app.totalPssKb > 0L -> formatMemoryKb(app.totalPssKb)
-                        app.running -> "后台运行中"
-                        else -> "未运行"
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = app.label,
+                            style = HushType.cardTitle,
+                            color = c.textPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .weight(1f, fill = false)
+                                .sharedElement(
+                                    state = rememberSharedContentState(key = "app_title_${app.appKey}"),
+                                    animatedVisibilityScope = animatedVisibilityScope,
+                                ),
+                        )
+                        if (app.isDualSpace) {
+                            Text(
+                                text = "双开",
+                                style = HushType.micro.copy(
+                                    fontSize = 10.sp,
+                                    lineHeight = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                ),
+                                color = c.blue,
+                                maxLines = 1,
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(c.blueSoft)
+                                    .padding(horizontal = 6.dp, vertical = 1.5.dp),
+                            )
+                        }
+                    }
+
+                    val memoryLine = buildString {
+                        when {
+                            app.restriction.disableApp -> append("已停用 · 系统无法拉起")
+                            app.totalPssKb > 0L && app.swapPssKb > 0L ->
+                                append("${formatMemoryKb(app.totalPssKb)} · Swap ${formatMemoryKb(app.swapPssKb)}")
+                            app.totalPssKb > 0L -> append(formatMemoryKb(app.totalPssKb))
+                            app.running -> append("后台运行中")
+                            else -> append("未运行")
+                        }
+                        if (customGroupNames.isNotEmpty()) {
+                            append(" · ${customGroupNames.first()}")
+                            if (customGroupNames.size > 1) append("+${customGroupNames.size - 1}")
+                        }
                     }
                     Text(
                         text = memoryLine,
@@ -497,7 +764,6 @@ private fun primaryStatusBadge(app: ManagedAppInfo): Triple<String, Color, Color
         app.isPlayingAudio -> Triple("音频中", c.purple, c.purple.copy(alpha = if (c.isDark) 0.24f else 0.12f))
         app.restriction.hasAnyRestriction -> Triple("已限后台", c.orange, c.orangeSoft)
         app.isFrozen -> Triple("冻结", c.indigo, c.indigoSoft)
-        app.isDualSpace -> Triple("双开", c.blue, c.blueSoft)
         app.running -> Triple("运行中", c.green, c.greenSoft)
         else -> null
     }

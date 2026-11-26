@@ -18,6 +18,55 @@ enum class AppGroup {
     UNSET,
 }
 
+/**
+ * Canonical backward-compatible key for identifying an app instance across user profiles.
+ * - Primary user (`userId == 0`): bare `packageName` (100% compatible with v0.1.x / v0.2.0 configs).
+ * - Clone / dual-space user (`userId != 0`): `"$packageName@$userId"` (e.g. `"com.tencent.mm@999"`).
+ */
+object AppKey {
+    fun encode(packageName: String, userId: Int = 0): String =
+        if (userId == 0) packageName else "$packageName@$userId"
+
+    fun decode(key: String): AppTarget {
+        val idx = key.lastIndexOf('@')
+        if (idx > 0 && idx < key.lastIndex) {
+            val uid = key.substring(idx + 1).toIntOrNull()
+            if (uid != null && uid > 0) {
+                return AppTarget(key.substring(0, idx), uid)
+            }
+        }
+        return AppTarget(key, 0)
+    }
+}
+
+data class AppTarget(
+    val packageName: String,
+    val userId: Int = 0,
+) {
+    val key: String
+        get() = AppKey.encode(packageName, userId)
+
+    val isDualSpace: Boolean
+        get() = userId != 0
+}
+
+/**
+ * User-defined app group supporting batch one-tap execution ("强杀本组" / "瘦身本组")
+ * as well as automatic background governance inheriting [action].
+ */
+data class CustomAppGroup(
+    val id: String,
+    val name: String,
+    val action: AppGroup = AppGroup.FORCE_STOP,
+    val appKeys: List<String> = emptyList(),
+)
+
+data class BatchActionResult(
+    val affectedCount: Int = 0,
+    val skippedCount: Int = 0,
+    val freedKb: Long = 0L,
+)
+
 enum class CleanupAction {
     FORCE_STOP,
     SOFT_TRIM,
@@ -74,6 +123,12 @@ data class ManagedAppInfo(
 ) {
     val isDualSpace: Boolean
         get() = userId != 0
+
+    val appKey: String
+        get() = AppKey.encode(packageName, userId)
+
+    val displayLabel: String
+        get() = if (isDualSpace) "$label (双开)" else label
 }
 
 data class MemoryOverview(
@@ -149,7 +204,43 @@ data class AppConfigSnapshot(
     val appGroups: Map<String, AppGroup> = emptyMap(),
     val policy: PolicyConfig = PolicyConfig(),
     val appliedRestrictions: Map<String, AppRestriction> = emptyMap(),
-)
+    val customGroups: List<CustomAppGroup> = emptyList(),
+) {
+    /**
+     * Resolves effective per-target governance tier by merging built-in [appGroups] and
+     * user-defined [customGroups] with safety-first precedence:
+     * SystemProtected / PROTECTED > SOFT_TRIM > FORCE_STOP > UNSET.
+     */
+    fun resolveEffectiveGroups(): Map<AppTarget, AppGroup> {
+        val result = LinkedHashMap<AppTarget, AppGroup>()
+        fun rank(g: AppGroup): Int = when (g) {
+            AppGroup.PROTECTED -> 3
+            AppGroup.SOFT_TRIM -> 2
+            AppGroup.FORCE_STOP -> 1
+            AppGroup.UNSET -> 0
+        }
+        fun merge(target: AppTarget, group: AppGroup) {
+            if (group == AppGroup.UNSET) return
+            if (SafetyGuardrails.isSystemProtected(target.packageName)) {
+                result[target] = AppGroup.PROTECTED
+                return
+            }
+            val current = result[target]
+            if (current == null || rank(group) > rank(current)) {
+                result[target] = group
+            }
+        }
+        for ((rawKey, group) in appGroups) {
+            merge(AppKey.decode(rawKey), group)
+        }
+        for (cg in customGroups) {
+            for (rawKey in cg.appKeys) {
+                merge(AppKey.decode(rawKey), cg.action)
+            }
+        }
+        return result
+    }
+}
 
 sealed interface DaemonStatus {
     data object Disconnected : DaemonStatus

@@ -24,6 +24,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Slider
@@ -59,8 +61,8 @@ import com.aileboeth.hush.design.HushType
 import com.aileboeth.hush.design.OdometerText
 import com.aileboeth.hush.design.applePressScale
 import com.aileboeth.hush.design.formatMemoryMb
+import com.aileboeth.hush.design.StaggerClock
 import com.aileboeth.hush.design.openExternalUrl
-import com.aileboeth.hush.design.rememberStaggerClock
 import com.aileboeth.hush.design.staggeredCascade
 import com.aileboeth.hush.state.HushUiState
 import com.aileboeth.hush.update.AppUpdater
@@ -83,18 +85,20 @@ fun PoliciesScreen(
     onOpenUpdateDialog: () -> Unit = {},
     onOpenDisclaimer: () -> Unit = {},
     onOpenDiagnostics: () -> Unit = {},
+    listState: LazyListState = rememberLazyListState(),
     modifier: Modifier = Modifier,
 ) {
     val c = HushTheme.colors
     val context = LocalContext.current
     val policy = uiState.policyConfig
     val isRunning = uiState.daemonStatus is DaemonStatus.Running
-    val stagger = rememberStaggerClock()
+    val stagger = remember { StaggerClock(windowMs = if (listState.firstVisibleItemIndex == 0) 900L else 0L) }
     val statusTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     var showRestoreDialog by remember { mutableStateOf(false) }
     var showStopDialog by remember { mutableStateOf(false) }
 
     LazyColumn(
+        state = listState,
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(
             start = 20.dp,
@@ -194,8 +198,8 @@ fun PoliciesScreen(
                     }
                     AppleInsetDivider()
                     AppleSwitchRow(
-                        title = "瘦身包含双开空间",
-                        subtitle = "默认关闭，保护双开微信/社交分身",
+                        title = "瘦身联动双开分身",
+                        subtitle = "主应用设瘦身时自动联动其双开分身（也可在应用页单独配置）",
                         checked = policy.softTrimIncludeDualSpace,
                         onCheckedChange = { onUpdatePolicy(policy.copy(softTrimIncludeDualSpace = it), true) },
                     )

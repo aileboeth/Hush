@@ -2,10 +2,13 @@ package com.aileboeth.hush.daemon
 
 import com.aileboeth.hush.contract.AppConfigSnapshot
 import com.aileboeth.hush.contract.AppGroup
+import com.aileboeth.hush.contract.AppKey
 import com.aileboeth.hush.contract.AppRestriction
 import com.aileboeth.hush.contract.AppRuntimeSample
+import com.aileboeth.hush.contract.AppTarget
 import com.aileboeth.hush.contract.CleanupAction
 import com.aileboeth.hush.contract.CleanupTrigger
+import com.aileboeth.hush.contract.CustomAppGroup
 import com.aileboeth.hush.contract.MemoryOverview
 import com.aileboeth.hush.contract.PolicyConfig
 import com.aileboeth.hush.contract.SecondaryUserInfo
@@ -48,7 +51,8 @@ class PolicyEngineTest {
         override fun listUserPackages(): Set<String> = runningPss.keys.toSet()
 
         override fun samplePackage(packageName: String, userId: Int): AppRuntimeSample {
-            val pss = runningPss[packageName] ?: 0L
+            val key = AppKey.encode(packageName, userId)
+            val pss = runningPss[key] ?: 0L
             return AppRuntimeSample(
                 packageName = packageName,
                 userId = userId,
@@ -56,8 +60,8 @@ class PolicyEngineTest {
                 totalPssKb = pss,
                 swapPssKb = pss / 2,
                 processCount = if (pss > 0L) 2 else 0,
-                restriction = restrictions[packageName] ?: AppRestriction(),
-                standbyBucket = if (restrictions[packageName]?.restrictedBucket == true) {
+                restriction = restrictions[key] ?: AppRestriction(),
+                standbyBucket = if (restrictions[key]?.restrictedBucket == true) {
                     StandbyBucket.RESTRICTED
                 } else {
                     StandbyBucket.ACTIVE
@@ -66,25 +70,27 @@ class PolicyEngineTest {
         }
 
         override fun forceStop(packageName: String, userId: Int): Boolean {
-            forceStopped.add(packageName)
-            runningPss.remove(packageName)
+            val key = AppKey.encode(packageName, userId)
+            forceStopped.add(key)
+            runningPss.remove(key)
             return true
         }
 
         override fun softTrim(packageName: String, userId: Int): Boolean {
-            softTrimmed.add(packageName)
-            val before = runningPss[packageName] ?: 0L
-            runningPss[packageName] = (before * 60) / 100 // simulate 40% cache shed while staying alive
+            val key = AppKey.encode(packageName, userId)
+            softTrimmed.add(key)
+            val before = runningPss[key] ?: 0L
+            runningPss[key] = (before * 60) / 100 // simulate 40% cache shed while staying alive
             return true
         }
 
         override fun applyRestriction(packageName: String, restriction: AppRestriction, userId: Int): Boolean {
-            restrictions[packageName] = restriction
+            restrictions[AppKey.encode(packageName, userId)] = restriction
             return true
         }
 
         override fun readRestriction(packageName: String, userId: Int): Pair<AppRestriction, StandbyBucket> {
-            val r = restrictions[packageName] ?: AppRestriction()
+            val r = restrictions[AppKey.encode(packageName, userId)] ?: AppRestriction()
             val b = if (r.restrictedBucket) StandbyBucket.RESTRICTED else StandbyBucket.ACTIVE
             return r to b
         }
@@ -341,5 +347,50 @@ class PolicyEngineTest {
         val (todayCount, todayFreed) = engine.getTodayStats()
         assertEquals(1, todayCount)
         assertEquals(840_000L, todayFreed)
+    }
+
+    @Test
+    fun customGroupBatchForceStopAndDualSpaceIsolationWorkCleanly() {
+        val bridge = FakeBridge()
+        bridge.runningPss["com.tencent.mm"] = 600_000L
+        bridge.runningPss["com.tencent.mm@999"] = 450_000L
+        bridge.runningPss["com.example.shop"] = 300_000L
+
+        val engine = PolicyEngine(
+            bridge = bridge,
+            initialConfig = AppConfigSnapshot(
+                customGroups = listOf(
+                    CustomAppGroup(
+                        id = "g1",
+                        name = "强杀组A",
+                        action = AppGroup.FORCE_STOP,
+                        appKeys = listOf("com.tencent.mm@999", "com.example.shop", "com.android.systemui"),
+                    ),
+                ),
+            ),
+        )
+
+        // Manual batch force-stop kills dual WeChat (999) + shop, skips systemui, leaves main WeChat (0) untouched!
+        val res = engine.manualForceStopBatch(
+            listOf(
+                AppTarget("com.tencent.mm", 999),
+                AppTarget("com.example.shop", 0),
+                AppTarget("com.android.systemui", 0),
+                AppTarget("com.example.stopped", 0),
+            ),
+        ).getOrThrow()
+
+        assertEquals(2, res.affectedCount)
+        assertEquals(1, res.skippedCount)
+        assertEquals(750_000L, res.freedKb)
+        assertTrue(bridge.runningPss.containsKey("com.tencent.mm"))
+        assertFalse(bridge.runningPss.containsKey("com.tencent.mm@999"))
+        assertFalse(bridge.runningPss.containsKey("com.example.shop"))
+
+        // Batch soft-trim on main WeChat trims 40% while keeping it alive
+        val trimRes = engine.manualSoftTrimBatch(listOf(AppTarget("com.tencent.mm", 0))).getOrThrow()
+        assertEquals(1, trimRes.affectedCount)
+        assertEquals(240_000L, trimRes.freedKb)
+        assertTrue(bridge.runningPss.containsKey("com.tencent.mm"))
     }
 }

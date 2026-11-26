@@ -5,9 +5,13 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import com.aileboeth.hush.contract.AppConfigSnapshot
 import com.aileboeth.hush.contract.AppGroup
+import com.aileboeth.hush.contract.AppKey
 import com.aileboeth.hush.contract.AppRestriction
 import com.aileboeth.hush.contract.AppRuntimeSample
+import com.aileboeth.hush.contract.AppTarget
+import com.aileboeth.hush.contract.BatchActionResult
 import com.aileboeth.hush.contract.CleanupEvent
+import com.aileboeth.hush.contract.CustomAppGroup
 import com.aileboeth.hush.contract.DaemonStatus
 import com.aileboeth.hush.contract.DiagnosticLogEntry
 import com.aileboeth.hush.contract.GuardController
@@ -18,6 +22,7 @@ import com.aileboeth.hush.contract.MemoryOverview
 import com.aileboeth.hush.contract.PolicyConfig
 import com.aileboeth.hush.contract.SafetyGuardrails
 import com.aileboeth.hush.contract.SecondaryUserInfo
+import com.aileboeth.hush.contract.StandbyBucket
 import com.aileboeth.hush.contract.intVal
 import com.aileboeth.hush.contract.listOfObj
 import com.aileboeth.hush.contract.longVal
@@ -31,6 +36,7 @@ import kotlinx.coroutines.withContext
 /**
  * Production implementation of [GuardController].
  * Bridges Compose UI state with `HushConfigStore` and the `uid=2000` `daemon-shell` via [DaemonClient].
+ * Supports primary (`user 0`) and clone/dual-space (`user 999`, etc.) apps, plus custom app groups.
  */
 class RealGuardController(
     private val context: Context,
@@ -40,6 +46,7 @@ class RealGuardController(
 
     private var configSnapshot: AppConfigSnapshot = store.loadConfig()
     private val labelCache = HashMap<String, String>()
+    private val cloneTargetsCache = LinkedHashSet<AppTarget>()
 
     private val _daemonStatus = MutableStateFlow<DaemonStatus>(DaemonStatus.Disconnected)
     override val daemonStatus: StateFlow<DaemonStatus> = _daemonStatus.asStateFlow()
@@ -58,6 +65,13 @@ class RealGuardController(
 
     private val _secondaryUsers = MutableStateFlow<List<SecondaryUserInfo>>(emptyList())
     override val secondaryUsers: StateFlow<List<SecondaryUserInfo>> = _secondaryUsers.asStateFlow()
+
+    private val _customGroups = MutableStateFlow(configSnapshot.customGroups)
+    override val customGroups: StateFlow<List<CustomAppGroup>> = _customGroups.asStateFlow()
+
+    init {
+        seedCloneCacheFromConfig()
+    }
 
     suspend fun attachSession(port: Int, token: String): Result<Unit> {
         _daemonStatus.value = DaemonStatus.Connecting
@@ -78,13 +92,13 @@ class RealGuardController(
     }
 
     override suspend fun refreshSnapshot(): Result<Unit> {
-        val installed = loadInstalledUserApps()
+        val user0Installed = loadInstalledUserApps()
         val statusRes = client.call(HushProtocol.METHOD_STATUS)
         if (statusRes.isFailure) {
             _daemonStatus.value = DaemonStatus.Disconnected
             _secondaryUsers.value = emptyList()
-            // Even when disconnected, show installed apps + saved groups so the user can configure offline
-            _managedApps.value = mergeAppsWithSamples(installed, emptyMap())
+            val allOffline = combineWithClones(user0Installed, cloneTargetsCache)
+            _managedApps.value = mergeAppsWithSamples(allOffline, emptyMap())
             return Result.failure(statusRes.exceptionOrNull()!!)
         }
 
@@ -103,21 +117,44 @@ class RealGuardController(
             resp.obj("data")?.let { _memoryOverview.value = HushProtocol.decodeMemory(it) }
         }
 
-        val targetPkgs = installed.map { it.first }
-        val sampleMap = HashMap<String, AppRuntimeSample>()
-        client.call(HushProtocol.METHOD_SAMPLE_APPS, mapOf("packages" to targetPkgs)).onSuccess { resp ->
+        // Discover dual-space / clone packages (e.g., Xspace / MultiApp user 999) from daemon
+        client.call(HushProtocol.METHOD_GET_CLONE_PACKAGES).onSuccess { resp ->
+            val clones = resp.obj("data")?.listOfObj("packages").orEmpty()
+                .map(HushProtocol::decodeAppTarget)
+                .filter { it.packageName.isNotBlank() && it.userId > 0 }
+            cloneTargetsCache.clear()
+            cloneTargetsCache.addAll(clones)
+        }
+
+        val combinedEntries = combineWithClones(user0Installed, cloneTargetsCache)
+        val allTargets = combinedEntries.map { AppTarget(it.packageName, it.userId) }
+        val sampleMap = HashMap<AppTarget, AppRuntimeSample>()
+        client.call(
+            HushProtocol.METHOD_SAMPLE_APPS,
+            mapOf(
+                "targets" to allTargets.map(HushProtocol::encodeAppTarget),
+                "packages" to user0Installed.map { it.packageName },
+            ),
+        ).onSuccess { resp ->
             val list = resp.obj("data")?.listOfObj("samples").orEmpty()
             for (item in list) {
                 val sample = HushProtocol.decodeAppSample(item)
-                sampleMap[sample.packageName] = sample
+                sampleMap[AppTarget(sample.packageName, sample.userId)] = sample
             }
         }
-        _managedApps.value = mergeAppsWithSamples(installed, sampleMap)
+        _managedApps.value = mergeAppsWithSamples(combinedEntries, sampleMap)
 
         client.call(HushProtocol.METHOD_GET_LOGS).onSuccess { resp ->
             val logs = resp.obj("data")?.listOfObj("logs").orEmpty().map { raw ->
                 val ev = HushProtocol.decodeCleanupEvent(raw)
-                ev.copy(appLabel = labelCache[ev.packageName] ?: ev.appLabel)
+                val target = AppKey.decode(ev.packageName)
+                val baseLabel = labelCache[target.packageName]
+                val resolvedLabel = when {
+                    baseLabel != null && target.isDualSpace -> "$baseLabel (双开)"
+                    baseLabel != null -> baseLabel
+                    else -> ev.appLabel
+                }
+                ev.copy(appLabel = resolvedLabel)
             }
             _cleanupLogs.value = logs
         }
@@ -131,22 +168,73 @@ class RealGuardController(
         return Result.success(Unit)
     }
 
-    override suspend fun setAppGroup(packageName: String, group: AppGroup): Result<Unit> {
+    override suspend fun setAppGroup(packageName: String, group: AppGroup, userId: Int): Result<Unit> {
         if (SafetyGuardrails.isSystemProtected(packageName) && group != AppGroup.PROTECTED) {
             return Result.failure(SecurityException("系统关键组件不可移出保护"))
         }
+        val key = AppKey.encode(packageName, userId)
         val updatedGroups = configSnapshot.appGroups.toMutableMap()
         if (group == AppGroup.UNSET) {
-            updatedGroups.remove(packageName)
+            updatedGroups.remove(key)
         } else {
-            updatedGroups[packageName] = group
+            updatedGroups[key] = group
         }
         configSnapshot = configSnapshot.copy(appGroups = updatedGroups)
         store.saveConfig(configSnapshot)
+        reapplyEffectiveGroupsInMemory()
+        syncConfigToDaemon()
+        return Result.success(Unit)
+    }
 
-        _managedApps.value = _managedApps.value.map {
-            if (it.packageName == packageName) it.copy(group = group) else it
+    override suspend fun setAppGroupsBatch(updates: Map<String, AppGroup>): Result<Unit> {
+        if (updates.isEmpty()) return Result.success(Unit)
+        val updatedGroups = configSnapshot.appGroups.toMutableMap()
+        for ((rawKey, group) in updates) {
+            val target = AppKey.decode(rawKey)
+            if (SafetyGuardrails.isSystemProtected(target.packageName) && group != AppGroup.PROTECTED) continue
+            if (group == AppGroup.UNSET) {
+                updatedGroups.remove(rawKey)
+            } else {
+                updatedGroups[rawKey] = group
+            }
         }
+        configSnapshot = configSnapshot.copy(appGroups = updatedGroups)
+        store.saveConfig(configSnapshot)
+        reapplyEffectiveGroupsInMemory()
+        syncConfigToDaemon()
+        return Result.success(Unit)
+    }
+
+    override suspend fun saveCustomGroup(group: CustomAppGroup): Result<Unit> {
+        val cleanName = group.name.trim()
+        if (cleanName.isEmpty()) {
+            return Result.failure(IllegalArgumentException("分组名称不能为空"))
+        }
+        val cleanGroup = group.copy(
+            name = cleanName,
+            appKeys = group.appKeys.distinct(),
+        )
+        val current = configSnapshot.customGroups.toMutableList()
+        val idx = current.indexOfFirst { it.id == cleanGroup.id }
+        if (idx >= 0) {
+            current[idx] = cleanGroup
+        } else {
+            current.add(cleanGroup)
+        }
+        configSnapshot = configSnapshot.copy(customGroups = current)
+        store.saveConfig(configSnapshot)
+        _customGroups.value = current
+        reapplyEffectiveGroupsInMemory()
+        syncConfigToDaemon()
+        return Result.success(Unit)
+    }
+
+    override suspend fun deleteCustomGroup(groupId: String): Result<Unit> {
+        val current = configSnapshot.customGroups.filterNot { it.id == groupId }
+        configSnapshot = configSnapshot.copy(customGroups = current)
+        store.saveConfig(configSnapshot)
+        _customGroups.value = current
+        reapplyEffectiveGroupsInMemory()
         syncConfigToDaemon()
         return Result.success(Unit)
     }
@@ -159,11 +247,14 @@ class RealGuardController(
         return Result.success(Unit)
     }
 
-    override suspend fun forceStopNow(packageName: String): Result<Long> {
+    override suspend fun forceStopNow(packageName: String, userId: Int): Result<Long> {
         if (SafetyGuardrails.isSystemProtected(packageName)) {
             return Result.failure(SecurityException("系统关键组件受保护"))
         }
-        val res = client.call(HushProtocol.METHOD_FORCE_STOP, mapOf("packageName" to packageName))
+        val res = client.call(
+            HushProtocol.METHOD_FORCE_STOP,
+            mapOf("packageName" to packageName, "userId" to userId),
+        )
         return res.map { resp ->
             resp.obj("data")?.longVal("freedKb") ?: 0L
         }.also {
@@ -171,11 +262,33 @@ class RealGuardController(
         }
     }
 
-    override suspend fun softTrimNow(packageName: String): Result<Long> {
+    override suspend fun forceStopBatch(targets: List<AppTarget>): Result<BatchActionResult> {
+        val safeTargets = targets.distinct().filterNot { SafetyGuardrails.isSystemProtected(it.packageName) }
+        if (safeTargets.isEmpty()) return Result.success(BatchActionResult())
+        val res = client.call(
+            HushProtocol.METHOD_FORCE_STOP_BATCH,
+            mapOf("targets" to safeTargets.map(HushProtocol::encodeAppTarget)),
+        )
+        return res.map { resp ->
+            val data = resp.obj("data").orEmpty()
+            BatchActionResult(
+                affectedCount = data.intVal("affectedCount"),
+                skippedCount = data.intVal("skippedCount"),
+                freedKb = data.longVal("freedKb"),
+            )
+        }.also {
+            if (it.isSuccess) refreshSnapshot()
+        }
+    }
+
+    override suspend fun softTrimNow(packageName: String, userId: Int): Result<Long> {
         if (SafetyGuardrails.isSystemProtected(packageName)) {
             return Result.failure(SecurityException("系统关键组件受保护"))
         }
-        val res = client.call(HushProtocol.METHOD_SOFT_TRIM, mapOf("packageName" to packageName))
+        val res = client.call(
+            HushProtocol.METHOD_SOFT_TRIM,
+            mapOf("packageName" to packageName, "userId" to userId),
+        )
         return res.map { resp ->
             resp.obj("data")?.longVal("freedKb") ?: 0L
         }.also {
@@ -183,8 +296,28 @@ class RealGuardController(
         }
     }
 
-    override suspend fun setAppRestriction(packageName: String, restriction: AppRestriction): Result<Unit> {
-        val group = configSnapshot.appGroups[packageName] ?: AppGroup.UNSET
+    override suspend fun softTrimBatch(targets: List<AppTarget>): Result<BatchActionResult> {
+        val safeTargets = targets.distinct().filterNot { SafetyGuardrails.isSystemProtected(it.packageName) }
+        if (safeTargets.isEmpty()) return Result.success(BatchActionResult())
+        val res = client.call(
+            HushProtocol.METHOD_SOFT_TRIM_BATCH,
+            mapOf("targets" to safeTargets.map(HushProtocol::encodeAppTarget)),
+        )
+        return res.map { resp ->
+            val data = resp.obj("data").orEmpty()
+            BatchActionResult(
+                affectedCount = data.intVal("affectedCount"),
+                skippedCount = data.intVal("skippedCount"),
+                freedKb = data.longVal("freedKb"),
+            )
+        }.also {
+            if (it.isSuccess) refreshSnapshot()
+        }
+    }
+
+    override suspend fun setAppRestriction(packageName: String, restriction: AppRestriction, userId: Int): Result<Unit> {
+        val target = AppTarget(packageName, userId)
+        val group = configSnapshot.resolveEffectiveGroups()[target] ?: AppGroup.UNSET
         if (restriction.hasAnyRestriction && SafetyGuardrails.isRestrictionBlocked(packageName, group)) {
             return Result.failure(SecurityException("保消息瘦身档与保护档禁止施加后台限制，以防漏消息"))
         }
@@ -192,15 +325,17 @@ class RealGuardController(
             HushProtocol.METHOD_SET_RESTRICTION,
             mapOf(
                 "packageName" to packageName,
+                "userId" to userId,
                 "restriction" to HushProtocol.encodeRestriction(restriction),
             ),
         )
         return res.map {
+            val key = AppKey.encode(packageName, userId)
             val updated = configSnapshot.appliedRestrictions.toMutableMap()
             if (restriction.hasAnyRestriction) {
-                updated[packageName] = restriction
+                updated[key] = restriction
             } else {
-                updated.remove(packageName)
+                updated.remove(key)
             }
             configSnapshot = configSnapshot.copy(appliedRestrictions = updated)
             store.saveConfig(configSnapshot)
@@ -276,38 +411,97 @@ class RealGuardController(
         client.call(HushProtocol.METHOD_SYNC_CONFIG, HushProtocol.encodeConfigSnapshot(configSnapshot))
     }
 
-    private suspend fun loadInstalledUserApps(): List<Pair<String, String>> = withContext(Dispatchers.IO) {
+    private fun seedCloneCacheFromConfig() {
+        val allKeys = buildList {
+            addAll(configSnapshot.appGroups.keys)
+            addAll(configSnapshot.appliedRestrictions.keys)
+            configSnapshot.customGroups.forEach { addAll(it.appKeys) }
+        }
+        for (raw in allKeys) {
+            val t = AppKey.decode(raw)
+            if (t.userId > 0) cloneTargetsCache.add(t)
+        }
+    }
+
+    private fun reapplyEffectiveGroupsInMemory() {
+        val effective = configSnapshot.resolveEffectiveGroups()
+        _managedApps.value = _managedApps.value.map { app ->
+            val group = if (app.isSystemProtected) {
+                AppGroup.PROTECTED
+            } else {
+                effective[AppTarget(app.packageName, app.userId)] ?: AppGroup.UNSET
+            }
+            app.copy(group = group)
+        }
+    }
+
+    private data class InstalledAppEntry(
+        val packageName: String,
+        val userId: Int,
+        val label: String,
+    )
+
+    private suspend fun loadInstalledUserApps(): List<InstalledAppEntry> = withContext(Dispatchers.IO) {
         val pm = context.packageManager
         val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
-        val result = ArrayList<Pair<String, String>>()
+        val trackedUser0Pkgs = HashSet<String>()
+        configSnapshot.appGroups.keys.mapTo(trackedUser0Pkgs) { AppKey.decode(it).packageName }
+        configSnapshot.appliedRestrictions.keys.mapTo(trackedUser0Pkgs) { AppKey.decode(it).packageName }
+        configSnapshot.customGroups.forEach { g ->
+            g.appKeys.mapTo(trackedUser0Pkgs) { AppKey.decode(it).packageName }
+        }
+
+        val result = ArrayList<InstalledAppEntry>()
         for (ai in apps) {
-            val isSystem = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0
-            val isUpdatedSystem = (ai.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
-            val isTracked = ai.packageName in configSnapshot.appliedRestrictions ||
-                ai.packageName in configSnapshot.appGroups ||
-                !ai.enabled
-            if (isSystem && !isUpdatedSystem && !isTracked) continue
-            if (ai.packageName == SafetyGuardrails.SELF_PACKAGE) continue
             val label = pm.getApplicationLabel(ai).toString()
             labelCache[ai.packageName] = label
-            result.add(ai.packageName to label)
+            val isSystem = (ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+            val isUpdatedSystem = (ai.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+            val isTracked = ai.packageName in trackedUser0Pkgs || !ai.enabled
+            if (isSystem && !isUpdatedSystem && !isTracked) continue
+            if (ai.packageName == SafetyGuardrails.SELF_PACKAGE) continue
+            result.add(InstalledAppEntry(ai.packageName, 0, label))
         }
-        result.sortBy { it.second.lowercase() }
+        result.sortBy { it.label.lowercase() }
         result
     }
 
+    private fun combineWithClones(
+        user0: List<InstalledAppEntry>,
+        clones: Set<AppTarget>,
+    ): List<InstalledAppEntry> {
+        if (clones.isEmpty()) return user0
+        val pm = context.packageManager
+        val out = ArrayList<InstalledAppEntry>(user0.size + clones.size)
+        out.addAll(user0)
+        val seen = HashSet<AppTarget>(user0.size + clones.size)
+        user0.forEach { seen.add(AppTarget(it.packageName, it.userId)) }
+
+        for (clone in clones) {
+            if (clone.userId <= 0 || !seen.add(clone)) continue
+            val label = labelCache[clone.packageName] ?: runCatching {
+                val ai = pm.getApplicationInfo(clone.packageName, 0)
+                pm.getApplicationLabel(ai).toString().also { labelCache[clone.packageName] = it }
+            }.getOrDefault(clone.packageName)
+            out.add(InstalledAppEntry(clone.packageName, clone.userId, label))
+        }
+        return out
+    }
+
     private fun mergeAppsWithSamples(
-        installed: List<Pair<String, String>>,
-        samples: Map<String, AppRuntimeSample>,
+        installed: List<InstalledAppEntry>,
+        samples: Map<AppTarget, AppRuntimeSample>,
     ): List<ManagedAppInfo> {
-        return installed.map { (pkg, label) ->
-            val s = samples[pkg]
-            val protectedSys = SafetyGuardrails.isSystemProtected(pkg)
-            val group = if (protectedSys) AppGroup.PROTECTED else (configSnapshot.appGroups[pkg] ?: AppGroup.UNSET)
+        val effective = configSnapshot.resolveEffectiveGroups()
+        return installed.map { entry ->
+            val target = AppTarget(entry.packageName, entry.userId)
+            val s = samples[target]
+            val protectedSys = SafetyGuardrails.isSystemProtected(entry.packageName)
+            val group = if (protectedSys) AppGroup.PROTECTED else (effective[target] ?: AppGroup.UNSET)
             ManagedAppInfo(
-                packageName = pkg,
-                label = label,
-                userId = s?.userId ?: 0,
+                packageName = entry.packageName,
+                label = entry.label,
+                userId = entry.userId,
                 isSystemProtected = protectedSys,
                 group = group,
                 running = s?.running ?: false,
@@ -316,14 +510,15 @@ class RealGuardController(
                 totalPssKb = s?.totalPssKb ?: 0L,
                 swapPssKb = s?.swapPssKb ?: 0L,
                 processCount = s?.processCount ?: 0,
-                restriction = s?.restriction ?: (configSnapshot.appliedRestrictions[pkg] ?: AppRestriction()),
-                standbyBucket = s?.standbyBucket ?: com.aileboeth.hush.contract.StandbyBucket.UNKNOWN,
+                restriction = s?.restriction ?: (configSnapshot.appliedRestrictions[target.key] ?: AppRestriction()),
+                standbyBucket = s?.standbyBucket ?: StandbyBucket.UNKNOWN,
                 lastForegroundMs = s?.lastForegroundMs ?: 0L,
             )
         }.sortedWith(
             compareByDescending<ManagedAppInfo> { it.totalPssKb }
                 .thenBy { it.group.ordinal }
                 .thenBy { it.label.lowercase() }
+                .thenBy { it.userId },
         )
     }
 }

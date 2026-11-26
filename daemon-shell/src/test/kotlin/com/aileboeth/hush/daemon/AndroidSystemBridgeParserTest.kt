@@ -170,4 +170,48 @@ class AndroidSystemBridgeParserTest {
         )
         assertEquals(setOf("com.vivo.magazine", "com.example.bloat"), disabled)
     }
+
+    @Test
+    fun detectsXspaceAsCloneAndIsolatesDualSpaceMeminfoAndForeground() {
+        // Xspace User must ALWAYS be classified as clone profile (never full secondary system), even if userId != 999
+        assertTrue(AndroidSystemBridge.isCloneUser(999, "Xspace User", 0x800010, isManaged = false))
+        assertTrue(AndroidSystemBridge.isCloneUser(12, "Xspace User", 0x410, isManaged = false))
+        assertTrue(AndroidSystemBridge.isCloneUser(999, "MultiApp", 0x4001010, isManaged = false))
+        assertFalse(AndroidSystemBridge.isCloneUser(10, "cys", 0x410, isManaged = false))
+        assertFalse(AndroidSystemBridge.isCloneUser(11, "Work", 0x1020, isManaged = true))
+
+        // Foreground target preserves exact userId (u0 vs u999)
+        val fgDual = AndroidSystemBridge.parseForegroundTarget(
+            "  topResumedActivity=ActivityRecord{abc u999 com.tencent.mm/.ui.LauncherUI t88}",
+        )
+        assertEquals("com.tencent.mm", fgDual?.packageName)
+        assertEquals(999, fgDual?.userId)
+
+        // Single-package meminfo summary isolates user 0 vs user 999 blocks via PID join
+        val dualMemOut = """
+            ** MEMINFO in pid 1001 [com.tencent.mm] **
+                       TOTAL PSS:   500000            TOTAL RSS:   300000       TOTAL SWAP PSS:   100000
+            ** MEMINFO in pid 2002 [com.tencent.mm] **
+                       TOTAL PSS:   320000            TOTAL RSS:   210000       TOTAL SWAP PSS:    80000
+        """.trimIndent()
+        val pidUsers = mapOf(2002 to 999)
+        val u0 = AndroidSystemBridge.parseMeminfoSummary("com.tencent.mm", 0, dualMemOut, pidToUserId = pidUsers)
+        val u999 = AndroidSystemBridge.parseMeminfoSummary("com.tencent.mm", 999, dualMemOut, pidToUserId = pidUsers)
+        assertEquals(500_000L, u0.totalPssKb)
+        assertEquals(1, u0.processCount)
+        assertEquals(320_000L, u999.totalPssKb)
+        assertEquals(1, u999.processCount)
+
+        val psPkgs = AndroidSystemBridge.parsePsPackagesByUser(
+            """
+            USER           NAME
+            u0_a120        com.tencent.mm
+            u999_a120      com.tencent.mm
+            u999_a120      com.tencent.mm:push
+            u999_a155      com.taobao.taobao
+            """.trimIndent(),
+            targetUsers = setOf(999),
+        )
+        assertEquals(setOf("com.tencent.mm", "com.taobao.taobao"), psPkgs[999])
+    }
 }

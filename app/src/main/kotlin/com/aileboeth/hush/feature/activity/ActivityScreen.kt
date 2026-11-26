@@ -33,6 +33,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.aileboeth.hush.AppleConfirmDialog
+import com.aileboeth.hush.contract.AppKey
 import com.aileboeth.hush.contract.CleanupAction
 import com.aileboeth.hush.contract.CleanupEvent
 import com.aileboeth.hush.design.AppIconAvatar
@@ -235,7 +236,8 @@ private fun CleanActivityRow(
             event.packageName != "*" &&
             !event.packageName.startsWith("user:")
         ) {
-            AppIconAvatar(packageName = event.packageName, label = event.appLabel, size = 38.dp)
+            val basePkg = AppKey.decode(event.packageName).packageName
+            AppIconAvatar(packageName = basePkg, label = event.appLabel, size = 38.dp)
         } else {
             Box(
                 modifier = Modifier

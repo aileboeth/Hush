@@ -71,6 +71,7 @@ import androidx.compose.ui.unit.sp
 import com.aileboeth.hush.AppleConfirmDialog
 import com.aileboeth.hush.contract.AppGroup
 import com.aileboeth.hush.contract.AppRestriction
+import com.aileboeth.hush.contract.CustomAppGroup
 import com.aileboeth.hush.contract.ManagedAppInfo
 import com.aileboeth.hush.contract.SafetyGuardrails
 import com.aileboeth.hush.design.AppIconAvatar
@@ -99,6 +100,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun AppDetailOverlay(
     app: ManagedAppInfo,
+    customGroups: List<CustomAppGroup> = emptyList(),
     fromOverview: Boolean,
     isDaemonOnline: Boolean,
     isBusy: Boolean,
@@ -106,6 +108,8 @@ fun AppDetailOverlay(
     animatedVisibilityScope: AnimatedVisibilityScope,
     onClose: () -> Unit,
     onSelectGroup: (AppGroup) -> Unit,
+    onToggleCustomGroup: (String) -> Unit = {},
+    onCreateCustomGroup: () -> Unit = {},
     onForceStop: () -> Unit,
     onSoftTrim: () -> Unit,
     onUpdateRestriction: (AppRestriction) -> Unit,
@@ -123,9 +127,9 @@ fun AppDetailOverlay(
     var dismissed by remember { mutableStateOf(false) }
     val restrictionBlocked = SafetyGuardrails.isRestrictionBlocked(app.packageName, app.group)
 
-    val cardKey = if (fromOverview) "app_card_overview_${app.packageName}" else "app_card_${app.packageName}"
-    val iconKey = if (fromOverview) "app_icon_overview_${app.packageName}" else "app_icon_${app.packageName}"
-    val titleKey = "app_title_${app.packageName}"
+    val cardKey = if (fromOverview) "app_card_overview_${app.appKey}" else "app_card_${app.appKey}"
+    val iconKey = if (fromOverview) "app_icon_overview_${app.appKey}" else "app_icon_${app.appKey}"
+    val titleKey = "app_title_${app.appKey}"
 
     fun triggerDismiss() {
         if (!dismissed) {
@@ -542,6 +546,75 @@ fun AppDetailOverlay(
                                     }
                                     if (idx < groups.lastIndex) {
                                         AppleInsetDivider(startIndent = 36.dp)
+                                    }
+                                }
+                            }
+                        }
+
+                        // Custom Groups membership quick-toggle
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                text = "自定义分组",
+                                style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                                color = c.textSecondary,
+                                modifier = Modifier.padding(start = 12.dp),
+                            )
+                            AppleGroupedCard(contentPadding = PaddingValues(14.dp)) {
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    customGroups.forEach { cg ->
+                                        val member = app.appKey in cg.appKeys
+                                        val accent = tierAccentColor(cg.action)
+                                        Surface(
+                                            modifier = Modifier.applePressScale(cornerRadius = 100.dp) {
+                                                onToggleCustomGroup(cg.id)
+                                            },
+                                            shape = RoundedCornerShape(100.dp),
+                                            color = if (member) accent.copy(alpha = if (c.isDark) 0.24f else 0.14f) else c.surfaceMuted,
+                                            border = if (member) BorderStroke(0.9.dp, accent) else null,
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                            ) {
+                                                Box(Modifier.size(6.dp).clip(CircleShape).background(accent))
+                                                Text(
+                                                    text = cg.name,
+                                                    style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                                                    color = if (member) accent else c.textPrimary,
+                                                )
+                                                if (member) {
+                                                    Icon(
+                                                        imageVector = HushIcons.Check,
+                                                        contentDescription = "已加入",
+                                                        tint = accent,
+                                                        modifier = Modifier.size(12.dp),
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Surface(
+                                        modifier = Modifier.applePressScale(cornerRadius = 100.dp, onClick = onCreateCustomGroup),
+                                        shape = RoundedCornerShape(100.dp),
+                                        color = c.blueSoft,
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                        ) {
+                                            Icon(HushIcons.Plus, null, tint = c.blue, modifier = Modifier.size(12.dp))
+                                            Text(
+                                                text = "新建组",
+                                                style = HushType.caption.copy(fontWeight = FontWeight.SemiBold),
+                                                color = c.blue,
+                                            )
+                                        }
                                     }
                                 }
                             }

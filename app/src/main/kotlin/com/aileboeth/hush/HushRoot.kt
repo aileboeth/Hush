@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -45,6 +46,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -86,6 +88,7 @@ import com.aileboeth.hush.feature.activation.StatusCapsulePopover
 import com.aileboeth.hush.feature.activity.ActivitySheetContent
 import com.aileboeth.hush.feature.apps.AppDetailOverlay
 import com.aileboeth.hush.feature.apps.AppsScreen
+import com.aileboeth.hush.feature.apps.GroupEditorSheetContent
 import com.aileboeth.hush.feature.diagnostics.DiagnosticsSheetContent
 import com.aileboeth.hush.feature.overview.OverviewScreen
 import com.aileboeth.hush.feature.overview.StatusCapsule
@@ -114,7 +117,27 @@ fun HushRoot(
     var activationProgress by remember { mutableFloatStateOf(0f) }
     var activityProgress by remember { mutableFloatStateOf(0f) }
     var diagnosticsProgress by remember { mutableFloatStateOf(0f) }
+    var groupEditorProgress by remember { mutableFloatStateOf(0f) }
     var showStopConfirm by remember { mutableStateOf(false) }
+
+    // Hoist scroll states ABOVE AnimatedContent & Crossfade so opening detail / force-stopping / switching tabs NEVER jumps back to top!
+    val overviewListState = rememberLazyListState()
+    val appsListState = rememberLazyListState()
+    val policiesListState = rememberLazyListState()
+    var savedAppsScrollIndex by remember { mutableIntStateOf(-1) }
+    var savedAppsScrollOffset by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(uiState.selectedAppKey) {
+        if (uiState.selectedAppKey == null && savedAppsScrollIndex >= 0) {
+            val targetIdx = savedAppsScrollIndex
+            val targetOffset = savedAppsScrollOffset
+            savedAppsScrollIndex = -1
+            // Guard against Compose chasing a moved firstVisibleItemKey after force-stop
+            if (kotlin.math.abs(appsListState.firstVisibleItemIndex - targetIdx) > 1) {
+                appsListState.scrollToItem(targetIdx, targetOffset)
+            }
+        }
+    }
 
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         store.setForegrounded(true)
@@ -127,17 +150,21 @@ fun HushRoot(
     BackHandler(enabled = showStopConfirm) {
         showStopConfirm = false
     }
-    BackHandler(enabled = !showStopConfirm && uiState.showDiagnosticsSheet) {
+    BackHandler(enabled = !showStopConfirm && uiState.groupEditorTarget != null) {
+        store.closeGroupEditor()
+    }
+    BackHandler(enabled = !showStopConfirm && uiState.groupEditorTarget == null && uiState.showDiagnosticsSheet) {
         store.closeDiagnosticsSheet()
     }
-    BackHandler(enabled = !showStopConfirm && !uiState.showDiagnosticsSheet && uiState.showActivitySheet) {
+    BackHandler(enabled = !showStopConfirm && uiState.groupEditorTarget == null && !uiState.showDiagnosticsSheet && uiState.showActivitySheet) {
         store.closeActivitySheet()
     }
-    BackHandler(enabled = !showStopConfirm && !uiState.showActivitySheet && uiState.showActivationSheet) {
+    BackHandler(enabled = !showStopConfirm && uiState.groupEditorTarget == null && !uiState.showActivitySheet && uiState.showActivationSheet) {
         store.closeActivationSheet()
     }
     BackHandler(
         enabled = !showStopConfirm &&
+            uiState.groupEditorTarget == null &&
             !uiState.showActivitySheet &&
             !uiState.showActivationSheet &&
             uiState.showStatusPopover,
@@ -146,19 +173,21 @@ fun HushRoot(
     }
     BackHandler(
         enabled = !showStopConfirm &&
+            uiState.groupEditorTarget == null &&
             !uiState.showActivitySheet &&
             !uiState.showActivationSheet &&
             !uiState.showStatusPopover &&
-            uiState.selectedAppPackage != null,
+            uiState.selectedAppKey != null,
     ) {
         store.closeAppDetail()
     }
     BackHandler(
         enabled = !showStopConfirm &&
+            uiState.groupEditorTarget == null &&
             !uiState.showActivitySheet &&
             !uiState.showActivationSheet &&
             !uiState.showStatusPopover &&
-            uiState.selectedAppPackage == null &&
+            uiState.selectedAppKey == null &&
             uiState.activeTab != HushTab.OVERVIEW,
     ) {
         store.selectTab(HushTab.OVERVIEW)
@@ -177,7 +206,7 @@ fun HushRoot(
 
     val statusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val statusBarTopPx = with(LocalDensity.current) { statusBarTop.toPx() }
-    val sheetDepth = maxOf(activationProgress, activityProgress, diagnosticsProgress).coerceIn(0f, 1f)
+    val sheetDepth = maxOf(activationProgress, activityProgress, diagnosticsProgress, groupEditorProgress).coerceIn(0f, 1f)
     val receded = sheetDepth > 0.35f
 
     // Keep system status-bar icons legible when the light backdrop recedes onto black behind a sheet
@@ -213,32 +242,41 @@ fun HushRoot(
             val sharedScope = this
 
             // Primary Tabbed Layer vs Shared-Element App Detail Page
+            // Key strictly by stable `selectedAppKey` (NOT mutable ManagedAppInfo) so force-stop / refresh updates IN-PLACE!
             AnimatedContent(
-                targetState = uiState.selectedApp,
+                targetState = uiState.selectedAppKey,
                 transitionSpec = { fadeIn(tween(240)) togetherWith fadeOut(tween(200)) },
                 label = "sharedAppDetail",
-            ) { selectedApp ->
+            ) { selectedKey ->
                 val animScope = this
+                val selectedApp = selectedKey?.let { k -> uiState.managedApps.firstOrNull { it.appKey == k } }
                 if (selectedApp != null) {
                     AppDetailOverlay(
                         app = selectedApp,
+                        customGroups = uiState.customGroups,
                         fromOverview = detailOpenedFromOverview,
                         isDaemonOnline = uiState.daemonStatus is DaemonStatus.Running,
-                        isBusy = selectedApp.packageName in uiState.busyPackages,
+                        isBusy = selectedApp.appKey in uiState.busyPackages,
                         sharedTransitionScope = sharedScope,
                         animatedVisibilityScope = animScope,
                         onClose = { store.closeAppDetail() },
                         onSelectGroup = { group ->
-                            store.setAppGroup(selectedApp.packageName, selectedApp.label, group)
+                            store.setAppGroup(selectedApp.packageName, selectedApp.displayLabel, group, selectedApp.userId)
+                        },
+                        onToggleCustomGroup = { groupId ->
+                            store.toggleAppInCustomGroup(groupId, selectedApp.appKey)
+                        },
+                        onCreateCustomGroup = {
+                            store.openCustomGroupEditor(null, preselectedAppKeys = setOf(selectedApp.appKey))
                         },
                         onForceStop = {
-                            store.forceStopNow(selectedApp.packageName, selectedApp.label)
+                            store.forceStopNow(selectedApp.packageName, selectedApp.displayLabel, selectedApp.userId)
                         },
                         onSoftTrim = {
-                            store.softTrimNow(selectedApp.packageName, selectedApp.label)
+                            store.softTrimNow(selectedApp.packageName, selectedApp.displayLabel, selectedApp.userId)
                         },
                         onUpdateRestriction = { restriction ->
-                            store.setAppRestriction(selectedApp.packageName, restriction)
+                            store.setAppRestriction(selectedApp.packageName, restriction, selectedApp.userId)
                         },
                         onCopiedNotice = { store.notify(it) },
                     )
@@ -264,13 +302,19 @@ fun HushRoot(
                                     onReconnect = { store.reconnectManual() },
                                     onOpenActivitySheet = { store.openActivitySheet() },
                                     onNavigateAppsFilter = { store.navigateToAppsWithFilter(it) },
-                                    onOpenAppDetail = { pkg ->
-                                        detailOpenedFromOverview = true
-                                        store.openAppDetail(pkg)
+                                    onNavigateCustomGroup = { store.navigateToAppsWithCustomGroup(it) },
+                                    onOpenCreateGroup = { store.openCustomGroupEditor(null) },
+                                    onExecuteGroupAction = { name, action, targets ->
+                                        store.executeGroupAction(name, action, targets)
                                     },
-                                    onQuickForceStop = { pkg, label -> store.forceStopNow(pkg, label) },
-                                    onQuickSoftTrim = { pkg, label -> store.softTrimNow(pkg, label) },
+                                    onOpenAppDetail = { appKey ->
+                                        detailOpenedFromOverview = true
+                                        store.openAppDetail(appKey)
+                                    },
+                                    onQuickForceStop = { pkg, label, uid -> store.forceStopNow(pkg, label, uid) },
+                                    onQuickSoftTrim = { pkg, label, uid -> store.softTrimNow(pkg, label, uid) },
                                     onStopSecondaryUser = { user -> store.stopSecondaryUser(user) },
+                                    listState = overviewListState,
                                 )
                                 HushTab.APPS -> AppsScreen(
                                     uiState = uiState,
@@ -278,13 +322,22 @@ fun HushRoot(
                                     animatedVisibilityScope = animScope,
                                     onRefresh = { store.refreshSnapshot() },
                                     onFilterChange = { store.setAppFilter(it) },
+                                    onSelectCustomGroup = { store.selectCustomGroup(it) },
                                     onSortChange = { store.setAppSort(it) },
                                     onSearchChange = { store.setAppSearchQuery(it) },
-                                    onSelectApp = { pkg ->
+                                    onSelectApp = { appKey ->
                                         detailOpenedFromOverview = false
-                                        store.openAppDetail(pkg)
+                                        savedAppsScrollIndex = appsListState.firstVisibleItemIndex
+                                        savedAppsScrollOffset = appsListState.firstVisibleItemScrollOffset
+                                        store.openAppDetail(appKey)
+                                    },
+                                    onOpenBuiltInGroupEditor = { store.openBuiltInGroupEditor(it) },
+                                    onOpenCustomGroupEditor = { store.openCustomGroupEditor(it) },
+                                    onExecuteGroupAction = { name, action, targets ->
+                                        store.executeGroupAction(name, action, targets)
                                     },
                                     onRestoreAllRestrictions = { store.restoreAllRestrictions() },
+                                    listState = appsListState,
                                 )
                                 HushTab.POLICIES -> PoliciesScreen(
                                     uiState = uiState,
@@ -297,6 +350,7 @@ fun HushRoot(
                                     onOpenUpdateDialog = { store.openUpdateDialog() },
                                     onOpenDisclaimer = { store.openDisclaimerDialog() },
                                     onOpenDiagnostics = { store.openDiagnosticsSheet() },
+                                    listState = policiesListState,
                                 )
                             }
                         }
@@ -407,6 +461,29 @@ fun HushRoot(
                 onClose = { store.closeDiagnosticsSheet() },
                 onNotice = { store.notify(it) },
             )
+        }
+
+        // Full-Height Batch Group Member & Custom Group Editor Sheet
+        AppleRubberBandSheet(
+            visible = uiState.groupEditorTarget != null,
+            onDismiss = { store.closeGroupEditor() },
+            allowHalfDetent = false,
+            containerColor = c.surface,
+            onProgress = { groupEditorProgress = it },
+        ) {
+            val target = uiState.groupEditorTarget
+            if (target != null) {
+                GroupEditorSheetContent(
+                    target = target,
+                    allApps = uiState.managedApps,
+                    onClose = { store.closeGroupEditor() },
+                    onSaveBuiltInMembers = { tier, keys -> store.saveBuiltInGroupMembers(tier, keys) },
+                    onSaveCustomGroup = { group ->
+                        store.saveCustomGroup(group, selectAfterSave = uiState.selectedAppKey == null)
+                    },
+                    onDeleteCustomGroup = { group -> store.deleteCustomGroup(group) },
+                )
+            }
         }
 
         // iOS-style Confirmation Overlay for Stop Daemon (triggered from Status Capsule Popover)

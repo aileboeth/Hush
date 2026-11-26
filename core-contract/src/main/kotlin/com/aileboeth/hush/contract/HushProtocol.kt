@@ -17,11 +17,14 @@ object HushProtocol {
     const val METHOD_SYNC_CONFIG = "sync_config"
     const val METHOD_FORCE_STOP = "force_stop"
     const val METHOD_SOFT_TRIM = "soft_trim"
+    const val METHOD_FORCE_STOP_BATCH = "force_stop_batch"
+    const val METHOD_SOFT_TRIM_BATCH = "soft_trim_batch"
     const val METHOD_SET_RESTRICTION = "set_restriction"
     const val METHOD_RESTORE_ALL = "restore_all"
     const val METHOD_GET_LOGS = "get_logs"
     const val METHOD_CLEAR_LOGS = "clear_logs"
     const val METHOD_GET_SECONDARY_USERS = "get_secondary_users"
+    const val METHOD_GET_CLONE_PACKAGES = "get_clone_packages"
     const val METHOD_STOP_USER = "stop_user"
     const val METHOD_GET_DIAGNOSTICS = "get_diagnostics"
     const val METHOD_CLEAR_DIAGNOSTICS = "clear_diagnostics"
@@ -119,10 +122,37 @@ object HushProtocol {
         skippedReason = m.strOrNull("skippedReason"),
     )
 
+    fun encodeAppTarget(t: AppTarget): Map<String, Any?> = mapOf(
+        "packageName" to t.packageName,
+        "userId" to t.userId,
+    )
+
+    fun decodeAppTarget(m: Map<String, Any?>): AppTarget = AppTarget(
+        packageName = m.str("packageName"),
+        userId = m.intVal("userId", 0),
+    )
+
+    fun encodeCustomGroup(g: CustomAppGroup): Map<String, Any?> = mapOf(
+        "id" to g.id,
+        "name" to g.name,
+        "action" to g.action.name,
+        "appKeys" to g.appKeys,
+    )
+
+    fun decodeCustomGroup(m: Map<String, Any?>): CustomAppGroup {
+        val id = m.str("id")
+        val name = m.str("name")
+        val action = runCatching { AppGroup.valueOf(m.str("action", AppGroup.FORCE_STOP.name)) }
+            .getOrDefault(AppGroup.FORCE_STOP)
+        val keys = (m["appKeys"] as? List<*>)?.mapNotNull { it as? String }?.distinct().orEmpty()
+        return CustomAppGroup(id = id, name = name, action = action, appKeys = keys)
+    }
+
     fun encodeConfigSnapshot(c: AppConfigSnapshot): Map<String, Any?> = mapOf(
         "appGroups" to c.appGroups.mapValues { it.value.name },
         "policy" to encodePolicy(c.policy),
         "appliedRestrictions" to c.appliedRestrictions.mapValues { encodeRestriction(it.value) },
+        "customGroups" to c.customGroups.map(::encodeCustomGroup),
     )
 
     fun decodeConfigSnapshot(m: Map<String, Any?>): AppConfigSnapshot {
@@ -139,10 +169,14 @@ object HushProtocol {
             pkg to decodeRestriction(objMap)
         }?.toMap().orEmpty()
 
+        val customGroups = m.listOfObj("customGroups").map(::decodeCustomGroup)
+            .filter { it.id.isNotBlank() && it.name.isNotBlank() }
+
         return AppConfigSnapshot(
             appGroups = groups,
             policy = policy,
             appliedRestrictions = restrictions,
+            customGroups = customGroups,
         )
     }
 
