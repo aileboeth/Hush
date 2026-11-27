@@ -188,6 +188,26 @@ data class HushUiState(
                 ActivityFilterMode.SKIPPED -> !ev.skippedReason.isNullOrBlank()
             }
         }
+
+    val persistedTodayFreedKb: Long
+        get() {
+            if (cleanupLogs.isEmpty()) return 0L
+            val cal = java.util.Calendar.getInstance().apply {
+                set(java.util.Calendar.HOUR_OF_DAY, 0)
+                set(java.util.Calendar.MINUTE, 0)
+                set(java.util.Calendar.SECOND, 0)
+                set(java.util.Calendar.MILLISECOND, 0)
+            }
+            val dayStart = cal.timeInMillis
+            return cleanupLogs.sumOf { ev ->
+                if (ev.timestampMs >= dayStart &&
+                    ev.skippedReason == null &&
+                    (ev.action == CleanupAction.FORCE_STOP ||
+                        ev.action == CleanupAction.SOFT_TRIM ||
+                        ev.action == CleanupAction.STOP_USER)
+                ) ev.freedKb else 0L
+            }
+        }
 }
 
 data class HushNotice(

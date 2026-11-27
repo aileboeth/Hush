@@ -89,4 +89,10 @@ interface SystemBridge {
      * MUST reject `userId <= 0` and the currently active foreground user.
      */
     fun stopUser(userId: Int): Boolean = false
+
+    /** Best-effort one-time `pm grant` of `WRITE_SECURE_SETTINGS` to Hush for Wi-Fi auto-recovery. */
+    fun grantSelfSecureSettings(): Boolean = false
+
+    /** Compact diagnostic line describing `/proc/self/cgroup` and `/proc/self/oom_score_adj`. */
+    fun readSelfDiagnosticsSummary(): String = ""
 }

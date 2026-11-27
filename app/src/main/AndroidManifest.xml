@@ -19,6 +19,11 @@
     <!-- Optional: in-app self-update APK installation from official GitHub Releases -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+    <!-- Optional: when granted via ADB shell, lets Hush re-enable adb_wifi_enabled on Wi-Fi to auto-recover after OEM adbd restarts -->
+    <uses-permission
+        android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+
     <application
         android:name=".HushApplication"
         android:allowBackup="false"

@@ -9,6 +9,7 @@ import com.aileboeth.hush.contract.SafetyGuardrails
 import com.aileboeth.hush.contract.SecondaryUserInfo
 import com.aileboeth.hush.contract.StandbyBucket
 import java.io.File
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
@@ -27,6 +28,9 @@ class AndroidSystemBridge : SystemBridge {
 
     private val uidToPkgCache = HashMap<Int, String>()
     private var uidCacheUpdatedMs = 0L
+    private val ioDrainExecutor = Executors.newCachedThreadPool { r ->
+        Thread(r, "hush-cmd-io").apply { isDaemon = true }
+    }
 
     @Volatile
     private var lastApplyRestrictionError: String? = null
@@ -449,6 +453,38 @@ class AndroidSystemBridge : SystemBridge {
         return code == 0
     }
 
+    override fun grantSelfSecureSettings(): Boolean {
+        val (code, out) = execCommandWithCode(
+            listOf("pm", "grant", SafetyGuardrails.SELF_PACKAGE, "android.permission.WRITE_SECURE_SETTINGS"),
+            timeoutMs = 4_000,
+        )
+        if (code == 0) {
+            HushLog.i("Bridge", "Granted WRITE_SECURE_SETTINGS to ${SafetyGuardrails.SELF_PACKAGE} for Wi-Fi auto-recovery")
+        } else {
+            HushLog.i(
+                "Bridge",
+                "Optional pm grant WRITE_SECURE_SETTINGS skipped rc=$code detail=${out.lineSequence().firstOrNull { it.isNotBlank() }?.take(100) ?: ""}",
+            )
+        }
+        return code == 0
+    }
+
+    override fun readSelfDiagnosticsSummary(): String {
+        val cgroup = runCatching {
+            File("/proc/self/cgroup").readLines().firstOrNull { it.isNotBlank() }?.trim()
+        }.getOrNull().orEmpty()
+        val oomAdj = runCatching {
+            File("/proc/self/oom_score_adj").readText().trim()
+        }.getOrNull().orEmpty()
+        return buildString {
+            if (cgroup.isNotEmpty()) append("cgroup=$cgroup")
+            if (oomAdj.isNotEmpty()) {
+                if (isNotEmpty()) append(' ')
+                append("oom_adj=$oomAdj")
+            }
+        }
+    }
+
     private fun listPackageProcesses(packageName: String, userId: Int): List<String> {
         val out = execCommand(listOf("ps", "-A", "-o", "USER,NAME"), timeoutMs = 3_000)
         val result = LinkedHashSet<String>()
@@ -500,13 +536,17 @@ class AndroidSystemBridge : SystemBridge {
     private fun execCommandWithCode(args: List<String>, timeoutMs: Long): Pair<Int, String> {
         return runCatching {
             val proc = ProcessBuilder(args).redirectErrorStream(true).start()
-            val output = proc.inputStream.bufferedReader().use { it.readText() }
+            val outFuture = ioDrainExecutor.submit<String> {
+                runCatching { proc.inputStream.bufferedReader().use { it.readText() } }.getOrDefault("")
+            }
             val finished = proc.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
             if (!finished) {
                 proc.destroyForcibly()
+                outFuture.cancel(true)
                 HushLog.w("Bridge", "Shell timeout (${timeoutMs}ms): ${args.take(4).joinToString(" ")}")
-                -1 to output
+                -1 to ""
             } else {
+                val output = runCatching { outFuture.get(1_000, TimeUnit.MILLISECONDS) }.getOrDefault("")
                 proc.exitValue() to output
             }
         }.getOrDefault(-1 to "")

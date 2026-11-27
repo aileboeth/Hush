@@ -1,6 +1,11 @@
 package com.aileboeth.hush.bootstrap
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.provider.Settings
 import com.aileboeth.hush.contract.BootstrapController
 import com.aileboeth.hush.contract.BootstrapState
 import com.aileboeth.hush.contract.HushLog
@@ -13,8 +18,14 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.security.SecureRandom
 
 /**
@@ -38,6 +49,7 @@ class WirelessBootstrapController(
     private val manualPort = 38921
     private val manualToken: String = generateRandomHexToken()
     private var discoveryJob: Job? = null
+    private val autoRecoverMutex = Mutex()
 
     @Volatile
     private var pairingNotificationActive: Boolean = false
@@ -294,6 +306,60 @@ class WirelessBootstrapController(
         }.onFailure { err ->
             _state.value = BootstrapState.Error("手动连接失败：${err.message}")
         }
+    }
+
+    override suspend fun autoRecoverOnWifi(timeoutMs: Long): Result<Unit> = withContext(Dispatchers.IO) {
+        autoRecoverMutex.withLock {
+            if (!_hasPairedBefore.value) {
+                return@withLock Result.failure(IllegalStateException("尚未完成无线调试配对"))
+            }
+            if (!isWifiConnectedInternal()) {
+                return@withLock Result.failure(IllegalStateException("当前未连接 Wi-Fi，无法自动拉起无线调试"))
+            }
+
+            val wifiAdbOn = runCatching {
+                Settings.Global.getInt(appContext.contentResolver, "adb_wifi_enabled", 0) == 1
+            }.getOrDefault(false)
+            if (!wifiAdbOn) {
+                val hasPerm = appContext.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) ==
+                    PackageManager.PERMISSION_GRANTED
+                if (hasPerm) {
+                    val toggled = runCatching {
+                        Settings.Global.putInt(appContext.contentResolver, "adb_wifi_enabled", 1)
+                    }.getOrDefault(false)
+                    HushLog.i("Bootstrap", "Auto-enabling adb_wifi_enabled via WRITE_SECURE_SETTINGS ok=$toggled")
+                } else {
+                    HushLog.i("Bootstrap", "adb_wifi_enabled=0 and WRITE_SECURE_SETTINGS not granted; scanning existing mDNS only")
+                }
+            }
+
+            val existing = mdns.endpoints.value.connect
+            val startedTemporarily = discoveryJob == null && existing == null
+            if (startedTemporarily) {
+                mdns.start()
+            }
+            val ep = existing ?: withTimeoutOrNull(timeoutMs.coerceIn(1_500L, 10_000L)) {
+                mdns.endpoints.map { it.connect }.filterNotNull().first()
+            }
+            if (ep == null) {
+                if (startedTemporarily) mdns.stop()
+                return@withLock Result.failure(IllegalStateException("未检测到无线调试端口，请确认已开启无线调试"))
+            }
+
+            HushLog.i("Bootstrap", "Auto-recover discovered wireless ADB ${ep.host}:${ep.port}, launching daemon")
+            val launchRes = launchDaemon(ep.host, ep.port)
+            if (launchRes.isFailure && startedTemporarily) {
+                mdns.stop()
+            }
+            launchRes
+        }
+    }
+
+    private fun isWifiConnectedInternal(): Boolean {
+        val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
     }
 
     companion object {

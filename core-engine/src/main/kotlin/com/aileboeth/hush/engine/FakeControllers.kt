@@ -527,6 +527,8 @@ class FakeBootstrapController(
         _state.value = BootstrapState.Ready(port = port, suggestDisableWirelessDebug = false)
         return Result.success(Unit)
     }
+
+    override suspend fun autoRecoverOnWifi(timeoutMs: Long): Result<Unit> = launchDaemon()
 }
 
 class FakeHushGraph : HushGraph {

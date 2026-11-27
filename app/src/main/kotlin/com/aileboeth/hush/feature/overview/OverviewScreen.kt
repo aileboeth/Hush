@@ -437,9 +437,10 @@ fun OverviewScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        val todayFreedKb = maxOf(runningStatus?.todayFreedKb ?: 0L, uiState.persistedTodayFreedKb)
                         HeroInlineStat(
                             label = "今日释放",
-                            value = if (runningStatus != null) formatMemoryKb(runningStatus.todayFreedKb) else "—",
+                            value = if (runningStatus != null || todayFreedKb > 0L) formatMemoryKb(todayFreedKb) else "—",
                             onClick = onOpenActivitySheet,
                             modifier = Modifier.weight(1f),
                         )

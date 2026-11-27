@@ -58,7 +58,10 @@ object HushLog {
 
     fun e(tag: String, message: String, throwable: Throwable? = null) {
         val full = if (throwable != null) {
-            val detail = throwable.stackTraceToString().lineSequence().take(6).joinToString(" | ")
+            val allLines = throwable.stackTraceToString().lineSequence().toList()
+            val head = allLines.take(12)
+            val causedBy = allLines.drop(12).filter { it.trimStart().startsWith("Caused by:") }.take(3)
+            val detail = (head + causedBy).joinToString(" | ")
             "$message — $detail"
         } else message
         append("E", tag, full)
@@ -78,7 +81,7 @@ object HushLog {
             .replace('\r', ' ')
             .replace('\n', ' ')
             .trim()
-            .take(600)
+            .take(1400)
 
     private fun append(level: String, tag: String, rawMessage: String) {
         val cleanMsg = sanitize(rawMessage)

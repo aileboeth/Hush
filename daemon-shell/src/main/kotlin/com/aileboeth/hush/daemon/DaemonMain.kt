@@ -3,6 +3,7 @@ package com.aileboeth.hush.daemon
 import com.aileboeth.hush.contract.HushLog
 import com.aileboeth.hush.contract.HushProtocol
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.CountDownLatch
@@ -22,7 +23,16 @@ object DaemonMain {
 
     @JvmStatic
     fun main(args: Array<String>) {
-        HushLog.configure("daemon", null)
+        val daemonLogFile = File("/data/local/tmp/hush_daemon.log").also { f ->
+            runCatching {
+                if (!f.exists()) f.createNewFile()
+                f.setReadable(false, false)
+                f.setReadable(true, true)
+                f.setWritable(false, false)
+                f.setWritable(true, true)
+            }
+        }
+        HushLog.configure("daemon", daemonLogFile)
         // Guard against stray worker exceptions killing app_process64
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             HushLog.e("DaemonUncaught", "Thread '${thread.name}' crashed", throwable)
@@ -73,13 +83,21 @@ object DaemonMain {
         )
 
         val actualPort = server.start()
-        HushLog.i("DaemonMain", "Daemon ready pid=${bridge.currentPid()} uid=${bridge.currentUid()} port=$actualPort vc=$versionCode")
+        val diagSummary = bridge.readSelfDiagnosticsSummary()
+        val diagSuffix = if (diagSummary.isNotBlank()) " $diagSummary" else ""
+        HushLog.i(
+            "DaemonMain",
+            "Daemon ready pid=${bridge.currentPid()} uid=${bridge.currentUid()} port=$actualPort vc=$versionCode$diagSuffix",
+        )
         // Signal the bootstrapper on stdout with the bound loopback port
         println("${HushProtocol.READY_PREFIX}$actualPort")
         System.out.flush()
 
         val scheduler = Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "hush-policy-loop").apply { isDaemon = true }
+        }
+        scheduler.execute {
+            runCatching { bridge.grantSelfSecureSettings() }
         }
 
         var nextTickAtMs = 0L
@@ -110,6 +128,7 @@ object DaemonMain {
         }, 5, 5, TimeUnit.SECONDS)
 
         Runtime.getRuntime().addShutdownHook(Thread {
+            HushLog.i("DaemonMain", "Shutdown hook triggered (graceful stop or SIGTERM)")
             scheduler.shutdownNow()
             server.stop()
             shutdownLatch.countDown()

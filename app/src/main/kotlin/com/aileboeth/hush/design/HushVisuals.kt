@@ -637,7 +637,7 @@ fun AppIconAvatar(
         )
     } else {
         val fallbackColors = listOf(c.blue, c.indigo, c.purple, c.cyan, c.green, c.orange)
-        val tint = fallbackColors[abs(packageName.hashCode()) % fallbackColors.size]
+        val tint = fallbackColors[Math.floorMod(packageName.hashCode(), fallbackColors.size)]
         val initial = label.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "A"
         Box(
             modifier = modifier

@@ -792,19 +792,6 @@ fun Modifier.staggeredCascade(
     }
 }
 
-/** Convenience overload allowing `Modifier.staggeredCascade(clock, index)`. */
-fun Modifier.staggeredCascade(
-    clock: StaggerClock,
-    index: Int,
-    stepMs: Long = 38L,
-    windowMs: Long = clock.windowMs,
-): Modifier = staggeredCascade(
-    index = index,
-    clock = clock,
-    stepMs = stepMs,
-    windowMs = windowMs,
-)
-
 /**
  * 6. Root-coordinate anchor for fluid capsule-to-popover morphing.
  */

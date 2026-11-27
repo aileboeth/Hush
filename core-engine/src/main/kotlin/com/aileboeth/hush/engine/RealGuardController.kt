@@ -60,7 +60,7 @@ class RealGuardController(
     private val _policyConfig = MutableStateFlow(configSnapshot.policy)
     override val policyConfig: StateFlow<PolicyConfig> = _policyConfig.asStateFlow()
 
-    private val _cleanupLogs = MutableStateFlow<List<CleanupEvent>>(emptyList())
+    private val _cleanupLogs = MutableStateFlow<List<CleanupEvent>>(store.loadCleanupLogs())
     override val cleanupLogs: StateFlow<List<CleanupEvent>> = _cleanupLogs.asStateFlow()
 
     private val _secondaryUsers = MutableStateFlow<List<SecondaryUserInfo>>(emptyList())
@@ -153,7 +153,7 @@ class RealGuardController(
         _managedApps.value = mergeAppsWithSamples(combinedEntries, sampleMap)
 
         client.call(HushProtocol.METHOD_GET_LOGS).onSuccess { resp ->
-            val logs = resp.obj("data")?.listOfObj("logs").orEmpty().map { raw ->
+            val incoming = resp.obj("data")?.listOfObj("logs").orEmpty().map { raw ->
                 val ev = HushProtocol.decodeCleanupEvent(raw)
                 val target = AppKey.decode(ev.packageName)
                 val baseLabel = labelCache[target.packageName]
@@ -164,7 +164,13 @@ class RealGuardController(
                 }
                 ev.copy(appLabel = resolvedLabel)
             }
-            _cleanupLogs.value = logs
+            val merged = mergeCleanupLogs(
+                incoming = incoming,
+                existing = _cleanupLogs.value,
+                maxEntries = HushConfigStore.MAX_PERSISTED_LOGS,
+            )
+            _cleanupLogs.value = merged
+            store.saveCleanupLogs(merged)
         }
 
         client.call(HushProtocol.METHOD_GET_SECONDARY_USERS).onSuccess { resp ->
@@ -362,9 +368,12 @@ class RealGuardController(
     }
 
     override suspend fun clearLogs(): Result<Unit> {
-        return client.call(HushProtocol.METHOD_CLEAR_LOGS).map {
-            _cleanupLogs.value = emptyList()
+        _cleanupLogs.value = emptyList()
+        store.clearCleanupLogs()
+        if (client.currentSession != null) {
+            client.call(HushProtocol.METHOD_CLEAR_LOGS)
         }
+        return Result.success(Unit)
     }
 
     override suspend fun stopSecondaryUser(userId: Int): Result<Long> {
@@ -528,5 +537,44 @@ class RealGuardController(
                 .thenBy { it.label.lowercase() }
                 .thenBy { it.userId },
         )
+    }
+
+    companion object {
+        /**
+         * Merges fresh daemon cleanup events with locally persisted history so records survive
+         * daemon restarts, disconnects, and app relaunches without duplicates.
+         */
+        internal fun mergeCleanupLogs(
+            incoming: List<CleanupEvent>,
+            existing: List<CleanupEvent>,
+            maxEntries: Int = HushConfigStore.MAX_PERSISTED_LOGS,
+        ): List<CleanupEvent> {
+            if (incoming.isEmpty()) return existing.take(maxEntries)
+            data class EventKey(
+                val timestampMs: Long,
+                val packageName: String,
+                val action: com.aileboeth.hush.contract.CleanupAction,
+                val trigger: com.aileboeth.hush.contract.CleanupTrigger,
+                val skippedReason: String?,
+            )
+            val merged = LinkedHashMap<EventKey, CleanupEvent>(incoming.size + existing.size)
+            for (ev in existing) {
+                val k = EventKey(ev.timestampMs, ev.packageName, ev.action, ev.trigger, ev.skippedReason)
+                merged[k] = ev
+            }
+            for (ev in incoming) {
+                val k = EventKey(ev.timestampMs, ev.packageName, ev.action, ev.trigger, ev.skippedReason)
+                val prev = merged[k]
+                val resolved = if (prev != null && ev.appLabel == ev.packageName && prev.appLabel != prev.packageName) {
+                    ev.copy(appLabel = prev.appLabel)
+                } else {
+                    ev
+                }
+                merged[k] = resolved
+            }
+            return merged.values
+                .sortedWith(compareByDescending<CleanupEvent> { it.timestampMs }.thenByDescending { it.id })
+                .take(maxEntries)
+        }
     }
 }

@@ -59,6 +59,8 @@ class HushStore(
 
     private var initialAutoConnectDone = false
     private var isForegrounded = true
+    private var userExplicitlyStopped = false
+    private var lastAutoRecoverAttemptMs = 0L
     private var livePollJob: Job? = null
     private var policyDebounceJob: Job? = null
     private var updateDownloadJob: Job? = null
@@ -162,10 +164,26 @@ class HushStore(
             _uiState.update { it.copy(isReconnecting = true) }
             val result = guard.reconnect()
             if (result.isFailure) {
-                guard.refreshSnapshot()
+                val recovered = trySilentWifiAutoRecover()
+                if (!recovered) {
+                    guard.refreshSnapshot()
+                }
             }
             _uiState.update { it.copy(isReconnecting = false) }
         }
+    }
+
+    private suspend fun trySilentWifiAutoRecover(): Boolean {
+        if (userExplicitlyStopped || !_uiState.value.hasPairedBefore) return false
+        val now = System.currentTimeMillis()
+        if (now - lastAutoRecoverAttemptMs < AUTO_RECOVER_COOLDOWN_MS) return false
+        lastAutoRecoverAttemptMs = now
+        val res = bootstrap.autoRecoverOnWifi(timeoutMs = 4_500L)
+        if (res.isSuccess) {
+            notify("已自动恢复后台守护进程")
+            return true
+        }
+        return false
     }
 
     private fun ensureLivePolling() {
@@ -200,8 +218,13 @@ class HushStore(
             if (status is DaemonStatus.Running) {
                 ensureLivePolling()
                 guard.refreshSnapshot()
-            } else if (!_uiState.value.isReconnecting) {
-                guard.reconnect()
+            } else if (!_uiState.value.isReconnecting && !userExplicitlyStopped) {
+                _uiState.update { it.copy(isReconnecting = true) }
+                val reconn = guard.reconnect()
+                if (reconn.isFailure) {
+                    trySilentWifiAutoRecover()
+                }
+                _uiState.update { it.copy(isReconnecting = false) }
             }
         }
     }
@@ -312,14 +335,28 @@ class HushStore(
 
     fun reconnectManual() {
         if (_uiState.value.isReconnecting) return
+        userExplicitlyStopped = false
         scope.launch {
             _uiState.update { it.copy(isReconnecting = true) }
             val res = guard.reconnect()
-            _uiState.update { it.copy(isReconnecting = false) }
-            res.fold(
-                onSuccess = { notify("已重新连接后台守护进程") },
-                onFailure = { err -> notify(err.message ?: "未检测到运行中的守护进程", isError = true) },
-            )
+            if (res.isSuccess) {
+                _uiState.update { it.copy(isReconnecting = false) }
+                notify("已重新连接后台守护进程")
+                return@launch
+            }
+            if (_uiState.value.hasPairedBefore) {
+                lastAutoRecoverAttemptMs = System.currentTimeMillis()
+                val recovered = bootstrap.autoRecoverOnWifi(timeoutMs = 5_500L)
+                _uiState.update { it.copy(isReconnecting = false) }
+                if (recovered.isSuccess) {
+                    notify("已通过无线调试自动恢复守护进程")
+                    return@launch
+                }
+            } else {
+                _uiState.update { it.copy(isReconnecting = false) }
+            }
+            val err = res.exceptionOrNull()
+            notify(err?.message ?: "未检测到运行中的守护进程", isError = true)
         }
     }
 
@@ -589,6 +626,7 @@ class HushStore(
 
     fun stopDaemon() {
         if (_uiState.value.isGlobalActionBusy) return
+        userExplicitlyStopped = true
         scope.launch {
             _uiState.update { it.copy(isGlobalActionBusy = true) }
             val res = guard.stopDaemon()
@@ -621,6 +659,7 @@ class HushStore(
     }
 
     fun launchDaemon(host: String? = null, port: Int? = null) {
+        userExplicitlyStopped = false
         scope.launch {
             bootstrap.launchDaemon(host, port).fold(
                 onSuccess = { notify("守护进程已激活并上线") },
@@ -630,6 +669,7 @@ class HushStore(
     }
 
     fun attachManualDaemon(port: Int = 0, token: String = "") {
+        userExplicitlyStopped = false
         scope.launch {
             bootstrap.attachManualDaemon(port, token).fold(
                 onSuccess = { notify("已连接 USB 启动的守护进程") },
@@ -819,5 +859,6 @@ class HushStore(
         private const val KEY_LAST_PROMPTED_VERSION = "last_prompted_update_version"
         private const val LIVE_POLL_INTERVAL_MS = 8_000L
         private const val MAX_HISTORY_POINTS = 24
+        private const val AUTO_RECOVER_COOLDOWN_MS = 30_000L
     }
 }

@@ -36,4 +36,17 @@ class HushLogTest {
             tmp.delete()
         }
     }
+
+    @Test
+    fun capturesCausedByChainInErrorLogs() {
+        HushLog.configure("app", null)
+        HushLog.clear()
+        val root = IllegalStateException("root-boom-cause")
+        val outer = RuntimeException("outer-wrapper", root)
+        HushLog.e("Crash", "Uncaught test", outer)
+        val entry = HushLog.snapshot().single()
+        assertTrue(entry.message.contains("outer-wrapper"))
+        assertTrue(entry.message.contains("root-boom-cause"))
+        HushLog.clear()
+    }
 }

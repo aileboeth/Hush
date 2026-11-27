@@ -105,6 +105,14 @@ interface BootstrapController {
 
     /** Attach to a daemon manually launched via the USB fallback command. */
     suspend fun attachManualDaemon(port: Int, token: String): Result<Unit>
+
+    /**
+     * Best-effort silent recovery when already paired and connected to Wi-Fi:
+     * re-enables `adb_wifi_enabled` if `WRITE_SECURE_SETTINGS` was granted, discovers the local
+     * wireless ADB connect port over mDNS, and relaunches `daemon-shell`.
+     */
+    suspend fun autoRecoverOnWifi(timeoutMs: Long = 5_500L): Result<Unit> =
+        Result.failure(UnsupportedOperationException("不支持自动恢复"))
 }
 
 /**
