@@ -215,8 +215,10 @@ fun DiagnosticsSheetContent(
                 .padding(top = 12.dp, bottom = 14.dp),
             horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            val loading = uiState.isDiagnosticsLoading
             ApplePillButton(
-                text = "复制日志",
+                text = if (loading) "拉取中…" else "复制日志",
+                enabled = !loading,
                 onClick = {
                     val report = buildDiagnosticReport(uiState, allLogs)
                     copyTextToClipboard(context, "Hush 诊断日志", report)
@@ -228,7 +230,8 @@ fun DiagnosticsSheetContent(
                 modifier = Modifier.weight(1f),
             )
             ApplePillButton(
-                text = "导出并分享",
+                text = if (loading) "拉取中…" else "导出并分享",
+                enabled = !loading,
                 onClick = {
                     val report = buildDiagnosticReport(uiState, allLogs)
                     shareDiagnosticFile(context, report).fold(

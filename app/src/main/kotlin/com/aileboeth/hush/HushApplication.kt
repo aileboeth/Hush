@@ -44,6 +44,9 @@ class HushApplication : Application() {
             context = applicationContext,
             graph = graph,
         )
+        if (!USE_FAKE_GRAPH) {
+            HushAutoRecoverJobService.schedule(applicationContext)
+        }
     }
 
     private fun installCrashLogger() {

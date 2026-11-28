@@ -117,7 +117,8 @@ object DaemonMain {
                         return@runCatching
                     }
                 }
-                val intervalMs = engine.getConfig().policy.pollIntervalSeconds.coerceIn(10, 300) * 1000L
+                val baseIntervalMs = engine.getConfig().policy.pollIntervalSeconds.coerceIn(10, 300) * 1000L
+                val intervalMs = if (engine.isScreenOffSleeping) maxOf(baseIntervalMs, 60_000L) else baseIntervalMs
                 if (now >= nextTickAtMs) {
                     nextTickAtMs = now + intervalMs
                     engine.tick()

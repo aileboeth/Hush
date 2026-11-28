@@ -395,12 +395,18 @@ class RealGuardController(
 
     override suspend fun fetchDiagnostics(): Result<List<DiagnosticLogEntry>> {
         val local = HushLog.snapshot()
-        val daemonEntries = if (client.currentSession != null) {
+        val liveDaemonEntries = if (client.currentSession != null) {
             client.call(HushProtocol.METHOD_GET_DIAGNOSTICS).getOrNull()
                 ?.obj("data")?.listOfObj("entries").orEmpty()
                 .map(HushProtocol::decodeDiagnosticEntry)
         } else {
-            emptyList()
+            null
+        }
+        val daemonEntries = if (liveDaemonEntries != null && liveDaemonEntries.isNotEmpty()) {
+            store.saveCachedDaemonDiagnostics(liveDaemonEntries)
+            liveDaemonEntries
+        } else {
+            store.loadCachedDaemonDiagnostics()
         }
         val merged = (local + daemonEntries).sortedBy { it.timestampMs }
         return Result.success(merged)
@@ -408,6 +414,7 @@ class RealGuardController(
 
     override suspend fun clearDiagnostics(): Result<Unit> {
         HushLog.clear()
+        store.clearCachedDaemonDiagnostics()
         if (client.currentSession != null) {
             client.call(HushProtocol.METHOD_CLEAR_DIAGNOSTICS)
         }

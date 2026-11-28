@@ -252,11 +252,20 @@ fun openExternalUrl(context: Context, url: String): Boolean = runCatching {
     true
 }.getOrDefault(false)
 
+@Suppress("DEPRECATION")
 fun isWifiConnected(context: Context): Boolean {
     val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
-    val network = cm.activeNetwork ?: return false
-    val caps = cm.getNetworkCapabilities(network) ?: return false
-    return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+    val activeCaps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+    if (activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) return true
+    for (network in cm.allNetworks) {
+        val caps = cm.getNetworkCapabilities(network) ?: continue
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        ) {
+            return true
+        }
+    }
+    return false
 }
 
 // --- Apple Minimalist Surfaces & Controls ---

@@ -42,6 +42,9 @@ class PolicyEngine(
     private var screenOffSinceMs: Long? = null
     private var screenOffCleanupExecuted: Boolean = false
 
+    val isScreenOffSleeping: Boolean
+        get() = screenOffSinceMs != null && screenOffCleanupExecuted
+
     private val eventLog = ArrayDeque<CleanupEvent>(MAX_LOG_ENTRIES)
     private val restrictionLedger = ConcurrentHashMap<AppTarget, AppRestriction>()
 
@@ -88,9 +91,24 @@ class PolicyEngine(
     fun tick() {
         val snap = config
         val now = bridge.nowMs()
+        val awake = bridge.isScreenAwake()
+
+        if (!awake) {
+            if (screenOffSinceMs == null) {
+                screenOffSinceMs = now
+                screenOffCleanupExecuted = false
+            } else if (screenOffCleanupExecuted) {
+                // Ultra-low-power screen-off sleep: once screen-off cleanup & secondary user stop
+                // have run, avoid hammering dumpsys meminfo / audio / appops all night long.
+                return
+            }
+        } else {
+            screenOffSinceMs = null
+            screenOffCleanupExecuted = false
+        }
+
         val currentUser = bridge.getCurrentUserId()
         val fg = bridge.getForegroundTarget()
-        val awake = bridge.isScreenAwake()
 
         if (currentUser != lastObservedUserId) {
             if (lastObservedUserId > 0) {
@@ -111,16 +129,6 @@ class PolicyEngine(
             lastForegroundMs[fg] = now
         }
 
-        if (!awake) {
-            if (screenOffSinceMs == null) {
-                screenOffSinceMs = now
-                screenOffCleanupExecuted = false
-            }
-        } else {
-            screenOffSinceMs = null
-            screenOffCleanupExecuted = false
-        }
-
         if (!snap.policy.enabled) return
 
         // Always evaluate secondary Android user auto-stop even when zero apps are tagged
@@ -138,7 +146,17 @@ class PolicyEngine(
         val managedEntries = effectiveGroups.filterValues {
             it == AppGroup.FORCE_STOP || it == AppGroup.SOFT_TRIM
         }
-        if (managedEntries.isEmpty()) return
+        val offSince = screenOffSinceMs
+        val screenOffReady = !awake &&
+            offSince != null &&
+            (now - offSince) >= snap.policy.screenOffDelayMinutes * 60_000L
+
+        if (managedEntries.isEmpty()) {
+            if (screenOffReady) {
+                screenOffCleanupExecuted = true
+            }
+            return
+        }
 
         val activeAudio = if (snap.policy.exemptActiveAudio) {
             bridge.getActiveAudioTargets()
@@ -149,24 +167,20 @@ class PolicyEngine(
         // Single multi-user O(1) batch snapshot across primary + clone targets
         val batchSamples = bridge.sampleTargetsBatch(managedEntries.keys.toList())
 
-        // 1. Screen-off batch cleanup (runs once after screenOffDelayMinutes)
-        val offSince = screenOffSinceMs
-        if (!awake &&
-            snap.policy.screenOffCleanupEnabled &&
-            !screenOffCleanupExecuted &&
-            offSince != null &&
-            (now - offSince) >= snap.policy.screenOffDelayMinutes * 60_000L
-        ) {
+        // 1. Screen-off batch cleanup (runs once after screenOffDelayMinutes, then enters deep sleep)
+        if (screenOffReady && !screenOffCleanupExecuted) {
             screenOffCleanupExecuted = true
-            runBatchCleanup(
-                targets = managedEntries,
-                samples = batchSamples,
-                activeAudio = activeAudio,
-                trigger = CleanupTrigger.SCREEN_OFF,
-                policy = snap.policy,
-                now = now,
-                ignoreForeground = true,
-            )
+            if (snap.policy.screenOffCleanupEnabled) {
+                runBatchCleanup(
+                    targets = managedEntries,
+                    samples = batchSamples,
+                    activeAudio = activeAudio,
+                    trigger = CleanupTrigger.SCREEN_OFF,
+                    policy = snap.policy,
+                    now = now,
+                    ignoreForeground = true,
+                )
+            }
             return
         }
 

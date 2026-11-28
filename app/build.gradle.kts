@@ -14,8 +14,8 @@ android {
         applicationId = "com.aileboeth.hush"
         minSdk = 31
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.2.3"
+        versionCode = 7
+        versionName = "0.2.4"
         buildConfigField("boolean", "USE_FAKE_GRAPH", useFakeGraph.toString())
     }
 

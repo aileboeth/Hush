@@ -117,11 +117,20 @@ class AndroidSystemBridge : SystemBridge {
         }
         if (candidates.isEmpty()) return emptySet()
 
+        // Verify running & non-frozen in O(1) using lightweight `ps` + `dumpsys activity processes`
+        // instead of per-package `dumpsys meminfo -S -s` (which frequently hits 5s timeouts on busy devices).
         val awake = isScreenAwake()
+        val psOut = execCommand(listOf("ps", "-A", "-o", "USER,NAME"), timeoutMs = 3_000)
+        val runningTargets = parsePsAllRunningTargets(psOut)
+        val procOut = execCommand(listOf("dumpsys", "activity", "processes"), timeoutMs = 5_000)
+        val frozenByUser = HashMap<Int, Set<String>>()
         val activeNonFrozen = LinkedHashSet<AppTarget>()
         for (target in candidates) {
-            val sample = samplePackageMemOnly(target.packageName, target.userId)
-            if (sample.running && !sample.isFrozen) {
+            if (target !in runningTargets) continue
+            val frozenSet = frozenByUser.getOrPut(target.userId) {
+                parseFrozenPackagesFromProcesses(procOut, targetUserId = target.userId)
+            }
+            if (target.packageName !in frozenSet) {
                 if (target.packageName in playingSessionPkgs || awake) {
                     activeNonFrozen.add(target)
                 }
@@ -471,7 +480,8 @@ class AndroidSystemBridge : SystemBridge {
 
     override fun readSelfDiagnosticsSummary(): String {
         val cgroup = runCatching {
-            File("/proc/self/cgroup").readLines().firstOrNull { it.isNotBlank() }?.trim()
+            val lines = File("/proc/self/cgroup").readLines().map { it.trim() }.filter { it.isNotEmpty() }
+            lines.firstOrNull { it.startsWith("0::") } ?: lines.lastOrNull()
         }.getOrNull().orEmpty()
         val oomAdj = runCatching {
             File("/proc/self/oom_score_adj").readText().trim()
@@ -611,6 +621,22 @@ class AndroidSystemBridge : SystemBridge {
 
         internal fun extractPsUserId(psUserColumn: String): Int? =
             PS_USER_PREFIX_REGEX.find(psUserColumn)?.groupValues?.get(1)?.toIntOrNull()
+
+        internal fun parsePsAllRunningTargets(output: String): Set<AppTarget> {
+            val result = HashSet<AppTarget>()
+            for (line in output.lineSequence()) {
+                val trimmed = line.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("USER")) continue
+                val parts = trimmed.split(Regex("\\s+"))
+                if (parts.size < 2) continue
+                val uid = extractPsUserId(parts[0]) ?: continue
+                val basePkg = parts[1].substringBefore(':')
+                if (basePkg.contains('.') && !basePkg.startsWith("[")) {
+                    result.add(AppTarget(basePkg, uid))
+                }
+            }
+            return result
+        }
 
         internal fun parsePsPackagesByUser(
             output: String,

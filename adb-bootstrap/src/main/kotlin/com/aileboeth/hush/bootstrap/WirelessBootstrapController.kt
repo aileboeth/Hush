@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.wifi.WifiManager
 import android.provider.Settings
 import com.aileboeth.hush.contract.BootstrapController
 import com.aileboeth.hush.contract.BootstrapState
@@ -15,6 +16,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -314,15 +316,16 @@ class WirelessBootstrapController(
                 return@withLock Result.failure(IllegalStateException("尚未完成无线调试配对"))
             }
             if (!isWifiConnectedInternal()) {
+                HushLog.i("Bootstrap", "Auto-recover skipped: Wi-Fi not connected")
                 return@withLock Result.failure(IllegalStateException("当前未连接 Wi-Fi，无法自动拉起无线调试"))
             }
 
+            val hasPerm = appContext.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) ==
+                PackageManager.PERMISSION_GRANTED
             val wifiAdbOn = runCatching {
                 Settings.Global.getInt(appContext.contentResolver, "adb_wifi_enabled", 0) == 1
             }.getOrDefault(false)
             if (!wifiAdbOn) {
-                val hasPerm = appContext.checkSelfPermission(Manifest.permission.WRITE_SECURE_SETTINGS) ==
-                    PackageManager.PERMISSION_GRANTED
                 if (hasPerm) {
                     val toggled = runCatching {
                         Settings.Global.putInt(appContext.contentResolver, "adb_wifi_enabled", 1)
@@ -338,11 +341,27 @@ class WirelessBootstrapController(
             if (startedTemporarily) {
                 mdns.start()
             }
-            val ep = existing ?: withTimeoutOrNull(timeoutMs.coerceIn(1_500L, 10_000L)) {
+            val effectiveTimeout = timeoutMs.coerceIn(2_000L, 10_000L)
+            var ep = existing ?: withTimeoutOrNull(effectiveTimeout) {
                 mdns.endpoints.map { it.connect }.filterNotNull().first()
             }
+
+            // If adb_wifi_enabled was already 1 but mDNS broadcast went stale (common after IP/DHCP bounce),
+            // toggle 0 -> 1 once to force adbd to re-advertise `_adb-tls-connect._tcp`.
+            if (ep == null && wifiAdbOn && hasPerm) {
+                HushLog.i("Bootstrap", "Auto-recover mDNS timed out with adb_wifi_enabled=1; bouncing 0->1 to refresh")
+                runCatching { Settings.Global.putInt(appContext.contentResolver, "adb_wifi_enabled", 0) }
+                delay(600L)
+                runCatching { Settings.Global.putInt(appContext.contentResolver, "adb_wifi_enabled", 1) }
+                mdns.start()
+                ep = withTimeoutOrNull(4_500L) {
+                    mdns.endpoints.map { it.connect }.filterNotNull().first()
+                }
+            }
+
             if (ep == null) {
                 if (startedTemporarily) mdns.stop()
+                HushLog.w("Bootstrap", "Auto-recover timed out waiting for wireless ADB mDNS (wifiAdbOn=$wifiAdbOn hasPerm=$hasPerm)")
                 return@withLock Result.failure(IllegalStateException("未检测到无线调试端口，请确认已开启无线调试"))
             }
 
@@ -355,11 +374,24 @@ class WirelessBootstrapController(
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun isWifiConnectedInternal(): Boolean {
         val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
-        val network = cm.activeNetwork ?: return false
-        val caps = cm.getNetworkCapabilities(network) ?: return false
-        return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+        val activeCaps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+        if (activeCaps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) return true
+        // When a VPN/proxy is active, activeNetwork may report TRANSPORT_VPN without TRANSPORT_WIFI;
+        // inspect all networks for an active Wi-Fi transport so auto-recovery still works under VPN!
+        for (net in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(net) ?: continue
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            ) {
+                return true
+            }
+        }
+        val wm = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val info = runCatching { wm?.connectionInfo }.getOrNull()
+        return info != null && info.networkId != -1 && info.ipAddress != 0
     }
 
     companion object {

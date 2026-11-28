@@ -39,6 +39,7 @@ class PolicyEngineTest {
         var activeUserId: Int = 0
         val secondaryUsers = ArrayList<SecondaryUserInfo>()
         val stoppedUsers = ArrayList<Int>()
+        var sampleCalls: Int = 0
 
         override fun nowMs(): Long = timeMs
         override fun currentPid(): Int = 4242
@@ -51,6 +52,7 @@ class PolicyEngineTest {
         override fun listUserPackages(): Set<String> = runningPss.keys.toSet()
 
         override fun samplePackage(packageName: String, userId: Int): AppRuntimeSample {
+            sampleCalls++
             val key = AppKey.encode(packageName, userId)
             val pss = runningPss[key] ?: 0L
             return AppRuntimeSample(
@@ -392,5 +394,40 @@ class PolicyEngineTest {
         assertEquals(1, trimRes.affectedCount)
         assertEquals(240_000L, trimRes.freedKb)
         assertTrue(bridge.runningPss.containsKey("com.tencent.mm"))
+    }
+
+    @Test
+    fun entersLowPowerSleepAfterScreenOffCleanupAndResumesOnWake() {
+        val bridge = FakeBridge()
+        bridge.awake = false
+        bridge.runningPss["com.example.shop"] = 300_000L
+        val engine = PolicyEngine(
+            bridge = bridge,
+            initialConfig = AppConfigSnapshot(
+                appGroups = mapOf("com.example.shop" to AppGroup.FORCE_STOP),
+                policy = PolicyConfig(screenOffCleanupEnabled = true, screenOffDelayMinutes = 2, memoryPressureEnabled = false),
+            ),
+        )
+
+        engine.tick() // starts screen-off timer
+        bridge.timeMs += 3 * 60_000L
+        engine.tick() // executes screen-off cleanup and enters sleep
+        assertTrue(engine.isScreenOffSleeping)
+        assertEquals(listOf("com.example.shop"), bridge.forceStopped)
+        val callsAtSleep = bridge.sampleCalls
+
+        // Subsequent screen-off ticks must NOT sample apps repeatedly
+        bridge.timeMs += 5 * 60_000L
+        engine.tick()
+        bridge.timeMs += 5 * 60_000L
+        engine.tick()
+        assertEquals(callsAtSleep, bridge.sampleCalls)
+
+        // Screen wakes up -> exits sleep cleanly
+        bridge.awake = true
+        bridge.timeMs += 60_000L
+        engine.tick()
+        assertFalse(engine.isScreenOffSleeping)
+        assertTrue(bridge.sampleCalls > callsAtSleep)
     }
 }
